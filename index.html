@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, interactive-widget=resizes-content">
+  <title>Editor</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      min-width: 100dvw;
+      min-height: 100dvh;
+      background-color: #222;
+    }
+  </style>
+  <script src="https://cdn.twind.style"></script>
+  <script>
+    twind.install({
+      darkMode: 'class',
+    })
+  </script>
+</head>
+
+<body>
+  <script>
+    window.OffscreenCanvas = window.OffscreenCanvas || window.webkitOffscreenCanvas || class OffscreenCanvas {
+      constructor(width, height) {
+        this.width = width
+        this.height = height
+        const canvas = document.createElement('canvas')
+        canvas.width = width
+        canvas.height = height
+        return canvas
+      }
+    }
+  </script>
+  <div id="app" class="flex w-full h-full"></div>
+  <script type="module" src="/examples/kitchen-sink.tsx"></script>
+</body>
+
+</html>
