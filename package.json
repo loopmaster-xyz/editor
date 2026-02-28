@@ -1,5 +1,5 @@
 {
-  "name": "@loopmaster/editor",
+  "name": "editor",
   "type": "module",
   "main": "src/editor.ts",
   "scripts": {
