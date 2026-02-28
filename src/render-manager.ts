@@ -109,7 +109,10 @@ function drawContext(context: Context, overlayCanvas: ReturnType<typeof createOv
     ? !positionToPreferAbove(primaryPosition!)
     : (primaryPosition != null ? positionToPreferAbove(primaryPosition) : false)
 
-  const error = context.mouse.hovered.error ?? context.pinnedError
+  const error = context.tooltipDismissed
+    ? context.mouse.hovered.error
+    : (context.mouse.hovered.error ?? context.pinnedError)
+  if (context.mouse.hovered.error) context.tooltipDismissed = false
   drawTooltip(context, error, overlayCanvas, preferErrorAbove)
 
   if (hoverDrew) {

@@ -53,12 +53,14 @@ export function createContext(editorSettings: Partial<EditorSettings>, doc: Doc,
   const caret = createCaret(settings)
   const selection = createSelection()
   let pinnedError: DocError | null = null
+  let tooltipDismissed = false
   const notifyActivated = () => activeEditorOpts?.setActiveEditor(activeEditorOpts.editorRef.current)
   const mouse = createMouse(canvas, scroll, lines, settings, caches, doc, caret, scrollbars, selection, gutter, blocks,
     header, notifyActivated)
   const keyboard = createKeyboard(doc, canvas, scroll, lines, metrics, settings, caret, caches, selection, blocks,
     header, mouse, () => {
     pinnedError = null
+    tooltipDismissed = true
   }, activeEditorOpts)
 
   const reset = () => {
@@ -85,6 +87,12 @@ export function createContext(editorSettings: Partial<EditorSettings>, doc: Doc,
     },
     set pinnedError(v) {
       pinnedError = v
+    },
+    get tooltipDismissed() {
+      return tooltipDismissed
+    },
+    set tooltipDismissed(v) {
+      tooltipDismissed = v
     },
     canvas,
     scroll,
