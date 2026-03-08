@@ -9,6 +9,7 @@ import { getActiveCanvas } from '../textarea-singleton.ts'
 import { shouldBreakBottom } from './widget.ts'
 
 const COLLAPSE_TOGGLE_SIZE = 11
+const COLLAPSE_TOGGLE_RIGHT_MARGIN = 5
 
 function lowerBoundVisualLineBottomAtLeast(visualLines: VisualLine[], minBottomY: number): number {
   let low = 0
@@ -111,8 +112,7 @@ export function drawGutter(context: Context) {
     }
 
     if (canCollapse && (isCollapsed || context.mouse.hovered.gutter)) {
-      const RIGHT_MARGIN = 5
-      const toggleX = gutterWidth - COLLAPSE_TOGGLE_SIZE - RIGHT_MARGIN
+      const toggleX = gutterWidth - COLLAPSE_TOGGLE_SIZE - COLLAPSE_TOGGLE_RIGHT_MARGIN
       const toggleY = lineY + 6.5
       const size = COLLAPSE_TOGGLE_SIZE - 4
       const centerX = toggleX + size / 2
@@ -190,7 +190,8 @@ export function hitTestGutter(
   const { y: scrollY } = scroll.pos
 
   const gutterX = x - paddingLeft
-  const isInGutterArea = x >= 0 && x < gutterWidth
+  const gutterInteractiveWidth = gutterWidth + paddingLeft
+  const isInGutterArea = x >= 0 && x < gutterInteractiveWidth
 
   if (!isInGutterArea || y < headerHeight) {
     return { type: null, line: null }
@@ -215,8 +216,7 @@ export function hitTestGutter(
       const canCollapse = blockStarts.has(logicalLine)
 
       if (canCollapse && isFirstVisualLine) {
-        const RIGHT_MARGIN = 4
-        const toggleX = gutterWidth - COLLAPSE_TOGGLE_SIZE - RIGHT_MARGIN
+        const toggleX = gutterWidth - COLLAPSE_TOGGLE_SIZE - COLLAPSE_TOGGLE_RIGHT_MARGIN
         const toggleRight = toggleX + COLLAPSE_TOGGLE_SIZE
         if (gutterX >= toggleX && gutterX <= toggleRight) {
           return { type: 'collapse', line: logicalLine }

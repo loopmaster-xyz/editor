@@ -694,15 +694,17 @@ export function createMouse(
   effect(() => {
     const { x, y } = pos
     const headerHeight = header.value?.height ?? 0
-    const gutterWidth = gutter.width.value
     const inHeader = y >= 0 && y < headerHeight
+    const gutterHit = hitTestGutter(canvas, settings, lines, scroll, gutter, x, y, headerHeight)
     const scrollbarHit = hitTestScrollbar(canvas, scroll, lines, settings, gutter, header, x, y)
     const belowWidgetHit = findBelowWidgetHit(x, y)
     const beforeAfterWidgetHit = findBeforeAfterWidgetHit(x, y)
-    canvas.el.style.cursor = (y < 0 || inHeader || x < gutterWidth || scrollbarHit.type !== null || belowWidgetHit
-        || beforeAfterWidgetHit || widgetPressed.value || headerPressed.value || scrollbars.isDragging.value)
-      ? 'default'
-      : 'text'
+    canvas.el.style.cursor = gutterHit.type === 'collapse'
+      ? 'pointer'
+      : (y < 0 || inHeader || gutterHit.type !== null || scrollbarHit.type !== null || belowWidgetHit
+          || beforeAfterWidgetHit || widgetPressed.value || headerPressed.value || scrollbars.isDragging.value)
+          ? 'default'
+          : 'text'
   })
 
   effect(() => {
