@@ -1,87 +1,187 @@
 import type { Context } from '../context.ts'
 import { findVisualLineForColumn, getColumnForTokenIndex, getTokenIndexFromColumn,
   getXFromColumn } from '../line-utils.ts'
-import { findCallBlockForToken, findTokenPositionInTokenLines, getParameterIndex,
-  getParameterStartToken } from '../mouse.ts'
+import { findCallBlockForToken, getParameterIndex, getParameterStartToken } from '../mouse.ts'
 import { createOverlayCanvas } from '../overlay-canvas.ts'
-import { calculateAboveHeightForLine } from './widget.ts'
-
 import { getActiveCanvas } from '../textarea-singleton.ts'
 import type { Token } from '../token.ts'
+import type { VisualLine } from '../lines.ts'
+import { calculateAboveHeightForLine } from './widget.ts'
+
+type CaretLayout = {
+  visualLine: VisualLine
+  contentX: number
+  contentY: number
+  screenX: number
+  screenY: number
+}
+
+function createSyntheticCaretLine(currentLine: number, y: number, lineHeight: number): VisualLine {
+  return {
+    tokens: [],
+    logicalLine: currentLine,
+    tokenOffset: 0,
+    y,
+    width: 0,
+    height: lineHeight,
+    widgets: {
+      above: [],
+      below: [],
+      overlay: [],
+      inlay: [],
+      beforeAfter: [],
+      full: [],
+    },
+    errors: [],
+  }
+}
+
+function resolveCaretVisualLine(context: Context, currentLine: number, currentColumn: number, tokenLines: Token[][]) {
+  const { lines, settings, caches } = context
+  let foundLine = findVisualLineForColumn(lines, currentLine, currentColumn, tokenLines, caches)
+  if (foundLine) return foundLine
+
+  const relevantLines = lines.visualLinesByLogicalLine.value.get(currentLine) ?? []
+  if (relevantLines.length > 0) return relevantLines[0]
+
+  const visualLines = lines.visualLines.value
+  const lastVisualLine = visualLines[visualLines.length - 1]
+  if (lastVisualLine && currentLine === lastVisualLine.logicalLine + 1) {
+    return createSyntheticCaretLine(currentLine, lastVisualLine.y + lastVisualLine.height, settings.lineHeight)
+  }
+
+  return null
+}
+
+function resolveBeforeWidgetOffset(context: Context, line: number, column: number): number {
+  let offset = 0
+  for (const widget of context.doc.widgets) {
+    if (widget.type === 'before' && widget.pos.y - 1 === line && widget.pos.x - 1 === column) {
+      offset += widget.pos.width
+    }
+  }
+  return offset
+}
+
+function toScreenPosition(context: Context, x: number, contentY: number): { x: number; y: number } {
+  const { settings, gutter, scroll, canvas, header } = context
+  const headerHeight = header.value?.height ?? 0
+  const canvasRect = canvas.rect
+
+  return {
+    x: x + gutter.width.value + settings.paddingLeft + scroll.pos.x + canvasRect.left,
+    y: contentY + headerHeight + settings.paddingTop + scroll.pos.y + canvasRect.top,
+  }
+}
+
+function resolveCaretLayout(context: Context): CaretLayout | null {
+  const { doc, lines, caret, settings, caches, canvas } = context
+  const codeLines = doc.lines
+  const currentLine = caret.line.value
+  const currentColumn = caret.column.value
+  if (currentLine < 0 || currentLine >= codeLines.length) return null
+
+  const tokenLines = doc.tokenLines
+  const foundLine = resolveCaretVisualLine(context, currentLine, currentColumn, tokenLines)
+  if (!foundLine) return null
+
+  const baseX = Math.max(1, getXFromColumn(lines, foundLine, currentColumn, tokenLines, canvas, settings, caches))
+  const contentX = baseX + resolveBeforeWidgetOffset(context, currentLine, currentColumn)
+  const aboveHeight = calculateAboveHeightForLine(context, foundLine)
+  const contentY = foundLine.tokenOffset === 0 ? foundLine.y : foundLine.y + aboveHeight
+  const screen = toScreenPosition(context, contentX, contentY)
+
+  return {
+    visualLine: foundLine,
+    contentX,
+    contentY,
+    screenX: screen.x,
+    screenY: screen.y,
+  }
+}
+
+function moveTokenPosition(tokenLines: Token[][], lineIndex: number, tokenIndex: number, delta: number): {
+  lineIndex: number
+  tokenIndex: number
+} | null
+{
+  if (delta === 0) return { lineIndex, tokenIndex }
+
+  let line = lineIndex
+  let token = tokenIndex
+
+  if (delta > 0) {
+    for (let i = 0; i < delta; i++) {
+      token++
+      while (line < tokenLines.length && token >= (tokenLines[line]?.length ?? 0)) {
+        line++
+        token = 0
+      }
+      if (line >= tokenLines.length) return null
+    }
+    return { lineIndex: line, tokenIndex: token }
+  }
+
+  for (let i = 0; i < -delta; i++) {
+    token--
+    while (line >= 0 && token < 0) {
+      line--
+      if (line < 0) return null
+      token = (tokenLines[line]?.length ?? 0) - 1
+    }
+    if (line < 0) return null
+  }
+
+  return { lineIndex: line, tokenIndex: token }
+}
+
+function findCallBlockTokenPositionFromAnchor(
+  tokenLines: Token[][],
+  callBlock: Token[],
+  anchorLine: number,
+  anchorTokenIndex: number,
+  anchorToken: Token,
+  targetToken: Token,
+): { lineIndex: number; tokenIndex: number } | null
+{
+  const anchorBlockIndex = callBlock.indexOf(anchorToken)
+  const targetBlockIndex = callBlock.indexOf(targetToken)
+  if (anchorBlockIndex < 0 || targetBlockIndex < 0) return null
+  return moveTokenPosition(tokenLines, anchorLine, anchorTokenIndex, targetBlockIndex - anchorBlockIndex)
+}
 
 export function drawCaret(context: Context) {
-  const { canvas, doc, lines, caret, settings, caches, gutter, scroll, header } = context
+  const { canvas, doc, lines, caret, settings, caches } = context
   const { c } = canvas
 
   const activeCanvas = getActiveCanvas()
   const isFocused = activeCanvas === canvas.el
   if (!isFocused) {
     caret.caretToken = null
+    caret.screenPosition = null
     return
   }
   if (context.mouse.buttonsDown.value) {
     caret.caretToken = null
+    caret.screenPosition = null
     return
   }
 
   const opacity = caret.updateBlink()
-
-  const visualLines = lines.visualLines.value
-  const codeLines = doc.code.split('\n')
-  const currentLine = caret.line.value
-  const currentColumn = caret.column.value
-
-  if (currentLine < 0 || currentLine >= codeLines.length) {
+  const layout = resolveCaretLayout(context)
+  if (!layout) {
     caret.caretToken = null
+    caret.screenPosition = null
     return
   }
 
+  const currentLine = caret.line.value
+  const currentColumn = caret.column.value
   const tokenLines = doc.tokenLines
-  let foundLine = findVisualLineForColumn(lines, currentLine, currentColumn, tokenLines, caches)
+  const foundLine = layout.visualLine
 
-  if (!foundLine) {
-    const visualLines = lines.visualLines.value
-    const relevantLines = visualLines.filter(line => line.logicalLine === currentLine)
-    if (relevantLines.length > 0) {
-      foundLine = relevantLines[0]
-    }
-    else {
-      const lastVisualLine = visualLines[visualLines.length - 1]
-      if (lastVisualLine && currentLine === lastVisualLine.logicalLine + 1) {
-        foundLine = {
-          tokens: [],
-          logicalLine: currentLine,
-          tokenOffset: 0,
-          y: lastVisualLine.y + lastVisualLine.height,
-          width: 0,
-          height: settings.lineHeight,
-          widgets: {
-            above: [],
-            below: [],
-            overlay: [],
-            inlay: [],
-            beforeAfter: [],
-            full: [],
-          },
-          errors: [],
-        }
-      }
-      else {
-        caret.caretToken = null
-        return
-      }
-    }
-  }
-
-  let x = Math.max(1, getXFromColumn(lines, foundLine, currentColumn, tokenLines, canvas, settings, caches))
-  for (const w of doc.widgets) {
-    if (w.type === 'before' && w.pos.y - 1 === currentLine && w.pos.x - 1 === currentColumn) {
-      x += w.pos.width
-    }
-  }
-
-  const aboveHeight = calculateAboveHeightForLine(context, foundLine)
-  const contentY = foundLine.tokenOffset === 0 ? foundLine.y : foundLine.y + aboveHeight
+  const x = layout.contentX
+  const contentY = layout.contentY
   const lineHeight = settings.lineHeight
 
   c.strokeStyle = settings.colors.brightWhite
@@ -92,16 +192,14 @@ export function drawCaret(context: Context) {
   c.lineTo(x, contentY + lineHeight)
   c.stroke()
   c.globalAlpha = 1
+  caret.screenPosition = { x: layout.screenX, y: layout.screenY }
 
   const logicalLineTokens = tokenLines[currentLine] || []
-  const lineText = codeLines[currentLine] || ''
   if (logicalLineTokens.length > 0 && foundLine.tokens.length > 0) {
     const tokenColumn = currentColumn > 0 ? currentColumn - 1 : currentColumn
-    let tokenIndex = getTokenIndexFromColumn(logicalLineTokens, tokenColumn)
-    let token = tokenIndex >= 0 && tokenIndex < logicalLineTokens.length ? logicalLineTokens[tokenIndex] : null
-
-    let finalToken: Token | null = token
-    let finalTokenIndex = tokenIndex
+    const tokenIndex = getTokenIndexFromColumn(logicalLineTokens, tokenColumn)
+    const finalTokenIndex = tokenIndex
+    const finalToken = tokenIndex >= 0 && tokenIndex < logicalLineTokens.length ? logicalLineTokens[tokenIndex] : null
 
     if (finalToken && finalTokenIndex >= 0 && finalTokenIndex < logicalLineTokens.length) {
       if (caret.isTyping.value) {
@@ -118,16 +216,12 @@ export function drawCaret(context: Context) {
           }
         }
 
-        const headerHeight = header.value?.height ?? 0
-        const scrollX = scroll.pos.x
-        const scrollY = scroll.pos.y
-        const canvasRect = canvas.rect
-        let screenX = tokenX + gutter.width.value + settings.paddingLeft + scrollX + canvasRect.left
-        let screenY = contentY + headerHeight + settings.paddingTop + scrollY + canvasRect.top
+        let { x: screenX, y: screenY } = toScreenPosition(context, tokenX, contentY)
         if (parameterIndex >= 0) {
           const paramStartToken = getParameterStartToken(callBlock, parameterIndex)
           if (paramStartToken) {
-            const pos = findTokenPositionInTokenLines(tokenLines, paramStartToken)
+            const pos = findCallBlockTokenPositionFromAnchor(tokenLines, callBlock, currentLine, finalTokenIndex,
+              finalToken, paramStartToken)
             if (pos) {
               const lineTokens = tokenLines[pos.lineIndex] || []
               const column = getColumnForTokenIndex(lineTokens, pos.tokenIndex)
@@ -137,8 +231,9 @@ export function drawCaret(context: Context) {
                 const paramContentY = paramLine.tokenOffset === 0
                   ? paramLine.y
                   : paramLine.y + calculateAboveHeightForLine(context, paramLine)
-                screenX = paramX + gutter.width.value + settings.paddingLeft + scrollX + canvasRect.left
-                screenY = paramContentY + headerHeight + settings.paddingTop + scrollY + canvasRect.top
+                const paramScreen = toScreenPosition(context, paramX, paramContentY)
+                screenX = paramScreen.x
+                screenY = paramScreen.y
               }
             }
           }
@@ -147,24 +242,34 @@ export function drawCaret(context: Context) {
         let callBlockX = screenX
         let callBlockY = screenY
         if (callBlock.length > 0) {
-          const lineTokens = tokenLines[currentLine] || []
-          let functionTokenIndex = -1
+          let functionToken: Token | null = null
           for (let i = 0; i < callBlock.length; i++) {
             const token = callBlock[i]
             if (token.text === '(' && i > 0) {
               const prevToken = callBlock[i - 1]
               if (prevToken && (prevToken.type === 'function' || prevToken.type === 'identifier')) {
-                functionTokenIndex = lineTokens.indexOf(prevToken)
+                functionToken = prevToken
                 break
               }
             }
           }
-          if (functionTokenIndex >= 0) {
-            for (const visualToken of foundLine.tokens) {
-              if (visualToken.logicalTokenIndex === functionTokenIndex) {
-                callBlockX = visualToken.x + gutter.width.value + settings.paddingLeft + scrollX + canvasRect.left
-                callBlockY = contentY + headerHeight + settings.paddingTop + scrollY + canvasRect.top
-                break
+          if (functionToken) {
+            const functionPos = findCallBlockTokenPositionFromAnchor(tokenLines, callBlock, currentLine, finalTokenIndex,
+              finalToken, functionToken)
+            if (functionPos) {
+              const functionLineTokens = tokenLines[functionPos.lineIndex] || []
+              const functionColumn = getColumnForTokenIndex(functionLineTokens, functionPos.tokenIndex)
+              const functionLine = findVisualLineForColumn(lines, functionPos.lineIndex, functionColumn, tokenLines,
+                caches)
+              if (functionLine) {
+                const functionX = getXFromColumn(lines, functionLine, functionColumn, tokenLines, canvas, settings,
+                  caches)
+                const functionContentY = functionLine.tokenOffset === 0
+                  ? functionLine.y
+                  : functionLine.y + calculateAboveHeightForLine(context, functionLine)
+                const functionScreen = toScreenPosition(context, functionX, functionContentY)
+                callBlockX = functionScreen.x
+                callBlockY = functionScreen.y
               }
             }
           }
@@ -194,46 +299,7 @@ export function drawCaret(context: Context) {
   }
 }
 
+/** @deprecated Use `context.caret.screenPosition` directly. */
 export function getCaretScreenPosition(context: Context): { x: number; y: number } | null {
-  const { doc, lines, caret, settings, caches, gutter, scroll, header } = context
-  const codeLines = doc.code.split('\n')
-  const currentLine = caret.line.value
-  const currentColumn = caret.column.value
-  if (currentLine < 0 || currentLine >= codeLines.length) return null
-  const tokenLines = doc.tokenLines
-  let foundLine = findVisualLineForColumn(lines, currentLine, currentColumn, tokenLines, caches)
-  if (!foundLine) {
-    const visualLines = lines.visualLines.value
-    const relevantLines = visualLines.filter(line => line.logicalLine === currentLine)
-    if (relevantLines.length > 0) foundLine = relevantLines[0]
-    else {
-      const lastVisualLine = visualLines[visualLines.length - 1]
-      if (lastVisualLine && currentLine === lastVisualLine.logicalLine + 1) {
-        foundLine = {
-          tokens: [],
-          logicalLine: currentLine,
-          tokenOffset: 0,
-          y: lastVisualLine.y + lastVisualLine.height,
-          width: 0,
-          height: settings.lineHeight,
-          widgets: { above: [], below: [], overlay: [], inlay: [], beforeAfter: [], full: [] },
-          errors: [],
-        }
-      }
-      else return null
-    }
-  }
-  const { canvas } = context
-  let x = Math.max(1, getXFromColumn(lines, foundLine, currentColumn, tokenLines, canvas, settings, caches))
-  for (const w of doc.widgets) {
-    if (w.type === 'before' && w.pos.y - 1 === currentLine && w.pos.x - 1 === currentColumn) x += w.pos.width
-  }
-  const aboveHeight = calculateAboveHeightForLine(context, foundLine)
-  const contentY = foundLine.tokenOffset === 0 ? foundLine.y : foundLine.y + aboveHeight
-  const headerHeight = header.value?.height ?? 0
-  const canvasRect = canvas.rect
-  return {
-    x: x + gutter.width.value + settings.paddingLeft + scroll.pos.x + canvasRect.left,
-    y: contentY + headerHeight + settings.paddingTop + scroll.pos.y + canvasRect.top,
-  }
+  return context.caret.screenPosition
 }

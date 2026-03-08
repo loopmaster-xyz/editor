@@ -1,6 +1,6 @@
 import { type Context, Position } from './context.ts'
 import { drawBlocks } from './draw/blocks.ts'
-import { drawCaret, getCaretScreenPosition } from './draw/caret.ts'
+import { drawCaret } from './draw/caret.ts'
 import { drawGutter, drawGutterBackground } from './draw/gutter.ts'
 import { drawHeader } from './draw/header.ts'
 import { drawLines } from './draw/lines.ts'
@@ -73,7 +73,7 @@ function drawContext(context: Context, overlayCanvas: ReturnType<typeof createOv
     : undefined
   const hoverCallBlockX = hoverToken ? hoverToken.contentCallBlockX + scroll.x + canvasRect.left : 0
   const hoverCallBlockY = hoverToken ? hoverToken.contentCallBlockY + scroll.y + canvasRect.top : 0
-  const caretPos = getCaretScreenPosition(context)
+  const caretPos = context.caret.screenPosition
 
   let hoverPosition: Position | null = null
   let caretPosition: Position | null = null

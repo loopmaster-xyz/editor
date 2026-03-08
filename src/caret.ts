@@ -14,6 +14,7 @@ export function createCaret(settings: Settings) {
 
   let startTime = Date.now()
   let suppressAutoScroll = false
+  let screenPosition: { x: number; y: number } | null = null
   let caretToken: {
     canvas: Canvas
     x: number
@@ -63,6 +64,12 @@ export function createCaret(settings: Settings) {
     },
     set suppressAutoScroll(value) {
       suppressAutoScroll = value
+    },
+    get screenPosition() {
+      return screenPosition
+    },
+    set screenPosition(value) {
+      screenPosition = value
     },
     get caretToken() {
       return caretToken
