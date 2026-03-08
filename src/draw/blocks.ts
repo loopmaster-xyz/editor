@@ -1,10 +1,33 @@
 import type { Context } from '../context.ts'
-import { findVisualLineForColumn, getXFromColumn, isLineEmpty } from '../line-utils.ts'
-import { calculateAboveHeightForLine } from './widget.ts'
+import { findVisualLineForColumn, getXFromColumn } from '../line-utils.ts'
+import { shouldBreakBottom } from './widget.ts'
 
 const OPACITY_HIGHLIGHT = 0.8
 const OPACITY_NORMAL = 0.3
 const LINE_WIDTH = 1
+
+function findFirstVisibleVisualLineIndex(
+  visualLines: Context['lines']['visualLines']['value'],
+  scrollY: number,
+  visibleTop: number,
+): number {
+  let low = 0
+  let high = visualLines.length
+
+  while (low < high) {
+    const mid = (low + high) >> 1
+    const line = visualLines[mid]
+    const lineBottom = line.y + line.height + scrollY
+    if (lineBottom < visibleTop) {
+      low = mid + 1
+    }
+    else {
+      high = mid
+    }
+  }
+
+  return low
+}
 
 export function drawBlocks(context: Context) {
   const { canvas, doc, lines, blocks, settings, caches, scroll, header, caret } = context
@@ -80,64 +103,17 @@ export function drawBlocks(context: Context) {
     return info
   }
 
-  function findBlockContainingLine(line: number): number | null {
-    if (line < 0 || line >= codeLines.length) return null
-
-    let bestStart: number | null = null
-    let bestEnd = -1
-
-    for (const startLine of blockStarts) {
-      if (startLine > line) continue
-      const info = getBlockInfo(startLine)
-      if (!info) continue
-      if (line >= startLine && line <= info.endLine) {
-        if (bestStart === null || startLine > bestStart) {
-          bestStart = startLine
-          bestEnd = info.endLine
-        }
-      }
-    }
-
-    return bestStart
-  }
-
-  function findNearestBlockStart(line: number): number | null {
-    if (line < 0 || line >= codeLines.length) return null
-
-    let nearest: number | null = null
-    for (const startLine of blockStarts) {
-      if (startLine <= line) {
-        if (nearest === null || startLine > nearest) {
-          nearest = startLine
-        }
-      }
-    }
-    return nearest
-  }
-
   const visibleLogicalLines = new Set<number>()
-  for (let i = 0; i < visualLines.length; i++) {
+  const visibleBottom = canvasHeight
+  const visibleStartIndex = findFirstVisibleVisualLineIndex(visualLines, scrollY, visibleTop)
+  for (let i = visibleStartIndex; i < visualLines.length; i++) {
     const visualLine = visualLines[i]
     const lineY = visualLine.y + scrollY
-    const aboveHeight = calculateAboveHeightForLine(context, visualLine)
-    const blockTop = lineY - aboveHeight
-    const blockBottom = lineY + visualLine.height
-    if (blockBottom > visibleTop && blockTop < canvasHeight) {
-      visibleLogicalLines.add(visualLine.logicalLine)
+    if (lineY + visualLine.height < visibleTop) continue
+    if (shouldBreakBottom(visualLines, visualLine, lineY, visibleBottom, scrollY)) {
+      break
     }
-    else if (isLineEmpty(visualLine)) {
-      for (let j = i + 1; j < visualLines.length; j++) {
-        const next = visualLines[j]
-        if (next.tokenOffset === 0 && next.widgets.above.length > 0) {
-          const nextAbove = calculateAboveHeightForLine(context, next)
-          const nextY = next.y + scrollY
-          if (nextY + next.height > visibleTop && nextY - nextAbove < canvasHeight) {
-            visibleLogicalLines.add(visualLine.logicalLine)
-          }
-          break
-        }
-      }
-    }
+    visibleLogicalLines.add(visualLine.logicalLine)
   }
 
   if (visibleLogicalLines.size === 0) {
@@ -148,15 +124,37 @@ export function drawBlocks(context: Context) {
   const blocksToDraw = new Set<number>()
 
   for (const logicalLine of visibleLogicalLines) {
-    const containingBlock = findBlockContainingLine(logicalLine)
+    const containingBlock = blocks.findContainingBlockStart(logicalLine)
     if (containingBlock !== null) {
       blocksToDraw.add(containingBlock)
     }
     else {
-      const nearestBlock = findNearestBlockStart(logicalLine)
+      const nearestBlock = blocks.findNearestBlockStartAtOrBefore(logicalLine)
       if (nearestBlock !== null) {
         blocksToDraw.add(nearestBlock)
       }
+    }
+  }
+
+  const initialBlocks = Array.from(blocksToDraw)
+  for (const startLine of initialBlocks) {
+    let current = startLine
+    while (true) {
+      const currentInfo = getBlockInfo(current)
+      if (!currentInfo || currentInfo.indent === 0) {
+        break
+      }
+
+      const parent = blocks.getParentBlockStart(current)
+      if (parent === null) {
+        break
+      }
+
+      if (!blocksToDraw.has(parent)) {
+        blocksToDraw.add(parent)
+      }
+
+      current = parent
     }
   }
 
@@ -256,49 +254,6 @@ export function drawBlocks(context: Context) {
     }
 
     c.stroke()
-  }
-
-  function walkUp(fromLine: number) {
-    if (fromLine < 0) return
-
-    for (let line = fromLine; line >= 0; line--) {
-      if (!blockStarts.has(line)) continue
-
-      const info = getBlockInfo(line)
-      if (!info) continue
-
-      if (!blocksToDraw.has(line)) {
-        blocksToDraw.add(line)
-      }
-
-      if (info.indent === 0) return
-    }
-  }
-
-  function walkDown(fromLine: number) {
-    if (fromLine >= codeLines.length) return
-
-    for (let line = fromLine; line < codeLines.length; line++) {
-      if (!blockStarts.has(line)) continue
-
-      const info = getBlockInfo(line)
-      if (!info) continue
-
-      if (!blocksToDraw.has(line)) {
-        blocksToDraw.add(line)
-      }
-
-      if (info.indent === 0) return
-    }
-  }
-
-  const visibleLinesArray = Array.from(visibleLogicalLines).sort((a, b) => a - b)
-  if (visibleLinesArray.length > 0) {
-    const firstVisibleLine = visibleLinesArray[0]
-    const lastVisibleLine = visibleLinesArray[visibleLinesArray.length - 1]
-
-    walkUp(firstVisibleLine - 1)
-    walkDown(lastVisibleLine + 1)
   }
 
   for (const startLine of blocksToDraw) {

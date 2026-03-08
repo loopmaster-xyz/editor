@@ -199,6 +199,30 @@ function findBlockEnd(codeLines: string[], startLine: number): number {
   return codeLines.length - 1
 }
 
+interface BlockNavigationIndex {
+  sortedStarts: number[]
+  parentByStart: Map<number, number | null>
+  indentByStart: Map<number, number>
+  endByStart: Map<number, number>
+}
+
+function upperBound(sorted: number[], target: number): number {
+  let low = 0
+  let high = sorted.length
+
+  while (low < high) {
+    const mid = (low + high) >> 1
+    if (sorted[mid] <= target) {
+      low = mid + 1
+    }
+    else {
+      high = mid
+    }
+  }
+
+  return low
+}
+
 export function createBlocks(doc: Doc, caches: Caches) {
   const blockStarts = computed(() => {
     const codeLines = doc.lines
@@ -219,6 +243,48 @@ export function createBlocks(doc: Doc, caches: Caches) {
       ends.set(startLine, findBlockEnd(codeLines, startLine))
     }
     return ends
+  })
+
+  const blockNavigation = computed<BlockNavigationIndex>(() => {
+    const starts = Array.from(blockStarts.value).sort((a, b) => a - b)
+    const codeLines = doc.lines
+    const endByStart = blockEnds.value
+    const parentByStart = new Map<number, number | null>()
+    const indentByStart = new Map<number, number>()
+    const stack: number[] = []
+
+    for (let i = 0; i < starts.length; i++) {
+      const startLine = starts[i]
+      const line = codeLines[startLine] ?? ''
+      const indent = line.length - line.trimStart().length
+      indentByStart.set(startLine, indent)
+
+      const endLine = endByStart.get(startLine)
+      if (endLine === undefined || endLine < startLine) {
+        parentByStart.set(startLine, null)
+        continue
+      }
+
+      while (stack.length > 0) {
+        const parentCandidate = stack[stack.length - 1]
+        const parentCandidateEnd = endByStart.get(parentCandidate)
+        if (parentCandidateEnd === undefined || parentCandidateEnd < startLine) {
+          stack.pop()
+          continue
+        }
+        break
+      }
+
+      parentByStart.set(startLine, stack.length > 0 ? stack[stack.length - 1] : null)
+      stack.push(startLine)
+    }
+
+    return {
+      sortedStarts: starts,
+      parentByStart,
+      indentByStart,
+      endByStart,
+    }
   })
 
   const braceDepths = computed(() => {
@@ -257,6 +323,44 @@ export function createBlocks(doc: Doc, caches: Caches) {
 
   const isCollapsed = (line: number): boolean => {
     return doc.collapsed.has(line)
+  }
+
+  const findNearestBlockStartAtOrBefore = (line: number): number | null => {
+    if (line < 0 || line >= doc.lines.length) return null
+
+    const { sortedStarts } = blockNavigation.value
+    if (sortedStarts.length === 0) return null
+
+    const index = upperBound(sortedStarts, line) - 1
+    if (index < 0) return null
+    return sortedStarts[index]
+  }
+
+  const findContainingBlockStart = (line: number): number | null => {
+    if (line < 0 || line >= doc.lines.length) return null
+
+    const { sortedStarts, endByStart, parentByStart } = blockNavigation.value
+    if (sortedStarts.length === 0) return null
+
+    const index = upperBound(sortedStarts, line) - 1
+    if (index < 0) return null
+
+    let current: number | null = sortedStarts[index]
+    while (current !== null) {
+      const endLine = endByStart.get(current)
+      if (endLine !== undefined && line <= endLine) {
+        return current
+      }
+      current = parentByStart.get(current) ?? null
+    }
+
+    return null
+  }
+
+  const getParentBlockStart = (startLine: number): number | null => {
+    const { parentByStart } = blockNavigation.value
+    if (!parentByStart.has(startLine)) return null
+    return parentByStart.get(startLine) ?? null
   }
 
   const toggle = (line: number) => {
@@ -454,6 +558,9 @@ export function createBlocks(doc: Doc, caches: Caches) {
     adjustOnLineInsertRange,
     adjustOnLineDelete,
     adjustOnLineDeleteRange,
+    findNearestBlockStartAtOrBefore,
+    findContainingBlockStart,
+    getParentBlockStart,
     findMatchingBrace,
     getBraceGlobalPos,
     getBraceDepthForPosition,

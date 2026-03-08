@@ -16,6 +16,7 @@ export function createCanvas(settings: Settings) {
   const ligatureDpr = computed(() => dpr.value * 1.5)
 
   const clear = () => {
+    c.clearRect(0, 0, width.value, height.value)
     c.fillStyle = settings.ui.background
     c.fillRect(0, 0, width.value, height.value)
   }

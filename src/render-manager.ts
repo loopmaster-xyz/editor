@@ -66,9 +66,11 @@ function drawContext(context: Context, overlayCanvas: ReturnType<typeof createOv
   const hoverX = hoverToken ? hoverToken.contentX + scroll.x + canvasRect.left : 0
   const hoverY = hoverToken ? hoverToken.contentY + scroll.y + canvasRect.top : 0
   const hoverParamX = hoverToken?.contentParamX != null
-    ? hoverToken.contentParamX + scroll.x + canvasRect.left : undefined
+    ? hoverToken.contentParamX + scroll.x + canvasRect.left
+    : undefined
   const hoverParamY = hoverToken?.contentParamY != null
-    ? hoverToken.contentParamY + scroll.y + canvasRect.top : undefined
+    ? hoverToken.contentParamY + scroll.y + canvasRect.top
+    : undefined
   const hoverCallBlockX = hoverToken ? hoverToken.contentCallBlockX + scroll.x + canvasRect.left : 0
   const hoverCallBlockY = hoverToken ? hoverToken.contentCallBlockY + scroll.y + canvasRect.top : 0
   const caretPos = getCaretScreenPosition(context)
@@ -78,20 +80,20 @@ function drawContext(context: Context, overlayCanvas: ReturnType<typeof createOv
 
   if (hoverIsPrimary && canDrawHover) {
     hoverPosition = context.onHoverToken!(overlayCanvas, hoverX, hoverY, hoverToken.token, hoverToken.callBlock,
-      hoverToken.parameterIndex, hoverCallBlockX, hoverCallBlockY, context.doc, hoverParamX, hoverParamY,
-      caretPos?.x, caretPos?.y)
+      hoverToken.parameterIndex, hoverCallBlockX, hoverCallBlockY, context.doc, hoverParamX, hoverParamY, caretPos?.x,
+      caretPos?.y)
   }
   else if (!hoverIsPrimary && canDrawCaret) {
-    caretPosition = context.onCaretToken!(overlayCanvas, caretToken.x, caretToken.y, caretToken.token, caretToken.callBlock,
-      caretToken.parameterIndex, caretToken.callBlockX, caretToken.callBlockY, context.doc,
+    caretPosition = context.onCaretToken!(overlayCanvas, caretToken.x, caretToken.y, caretToken.token,
+      caretToken.callBlock, caretToken.parameterIndex, caretToken.callBlockX, caretToken.callBlockY, context.doc,
       undefined, undefined, caretPos?.x, caretPos?.y)
   }
 
   if (hoverPosition == null && caretPosition == null) {
     if (currentlyActive === 'hover' && canDrawHover) {
-      hoverPosition = context.onHoverToken!(overlayCanvas, hoverX, hoverY, hoverToken.token,
-        hoverToken.callBlock, hoverToken.parameterIndex, hoverCallBlockX, hoverCallBlockY, context.doc,
-        hoverParamX, hoverParamY, caretPos?.x, caretPos?.y)
+      hoverPosition = context.onHoverToken!(overlayCanvas, hoverX, hoverY, hoverToken.token, hoverToken.callBlock,
+        hoverToken.parameterIndex, hoverCallBlockX, hoverCallBlockY, context.doc, hoverParamX, hoverParamY, caretPos?.x,
+        caretPos?.y)
     }
     else if (currentlyActive === 'caret' && canDrawCaret) {
       caretPosition = context.onCaretToken!(overlayCanvas, caretToken.x, caretToken.y, caretToken.token,
@@ -103,8 +105,7 @@ function drawContext(context: Context, overlayCanvas: ReturnType<typeof createOv
   const hoverDrew = hoverPosition != null
   const caretDrew = caretPosition != null
   const primaryPosition = hoverIsPrimary ? hoverPosition : caretPosition
-  const positionToPreferAbove = (p: Position) =>
-    p === Position.BottomLeft || p === Position.BottomRight
+  const positionToPreferAbove = (p: Position) => p === Position.BottomLeft || p === Position.BottomRight
   const preferErrorAbove = hoverDrew && caretDrew
     ? !positionToPreferAbove(primaryPosition!)
     : (primaryPosition != null ? positionToPreferAbove(primaryPosition) : false)
