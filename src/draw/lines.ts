@@ -15,6 +15,24 @@ import {
   shouldBreakBottom,
 } from './widget.ts'
 
+function lowerBoundVisualLineBottomAtLeast(visualLines: VisualLine[], minBottomY: number): number {
+  let low = 0
+  let high = visualLines.length
+
+  while (low < high) {
+    const mid = (low + high) >> 1
+    const line = visualLines[mid]
+    if (line.y + line.height < minBottomY) {
+      low = mid + 1
+    }
+    else {
+      high = mid
+    }
+  }
+
+  return low
+}
+
 function isBraceOrQuoteChar(char: string) {
   switch (char) {
     case '{':
@@ -146,15 +164,19 @@ export function drawLine(
 
 export function drawLines(context: Context) {
   const visualLines = context.lines.visualLines.value
+  if (visualLines.length === 0) return
   const { size: { height: { value: height } } } = context.canvas
   const { paddingTop } = context.settings
   const { y } = context.scroll.pos
   const headerHeight = context.header.value?.height ?? 0
   const visibleTop = -headerHeight - paddingTop
   const visibleBottom = height - paddingTop
-  for (const line of visualLines) {
+  const startIndex = lowerBoundVisualLineBottomAtLeast(visualLines, visibleTop - y)
+  if (startIndex >= visualLines.length) return
+
+  for (let i = startIndex; i < visualLines.length; i++) {
+    const line = visualLines[i]
     const lineY = line.y + y
-    if (lineY + line.height < visibleTop) continue
     if (shouldBreakBottom(visualLines, line, lineY, visibleBottom, y)) break
     drawLine(context, line)
   }

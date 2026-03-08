@@ -2,13 +2,31 @@ import type { Canvas } from '../canvas.ts'
 import type { Context } from '../context.ts'
 import type { Gutter } from '../gutter.ts'
 import { findVisualLineForColumn } from '../line-utils.ts'
-import type { Lines } from '../lines.ts'
+import type { Lines, VisualLine } from '../lines.ts'
 import type { Scroll } from '../scroll.ts'
 import type { Settings } from '../settings.ts'
 import { getActiveCanvas } from '../textarea-singleton.ts'
 import { shouldBreakBottom } from './widget.ts'
 
 const COLLAPSE_TOGGLE_SIZE = 11
+
+function lowerBoundVisualLineBottomAtLeast(visualLines: VisualLine[], minBottomY: number): number {
+  let low = 0
+  let high = visualLines.length
+
+  while (low < high) {
+    const mid = (low + high) >> 1
+    const line = visualLines[mid]
+    if (line.y + line.height < minBottomY) {
+      low = mid + 1
+    }
+    else {
+      high = mid
+    }
+  }
+
+  return low
+}
 
 export function drawGutterBackground(context: Context) {
   if (!context.settings.showGutter) return
@@ -57,9 +75,10 @@ export function drawGutter(context: Context) {
 
   c.save()
 
-  for (const visualLine of visualLines) {
+  const startIndex = lowerBoundVisualLineBottomAtLeast(visualLines, visibleTop - scrollY)
+  for (let i = startIndex; i < visualLines.length; i++) {
+    const visualLine = visualLines[i]
     const lineY = visualLine.y + scrollY
-    if (lineY + visualLine.height < visibleTop) continue
     if (shouldBreakBottom(visualLines, visualLine, lineY, visibleBottom, scrollY)) break
 
     const logicalLine = visualLine.logicalLine
@@ -182,10 +201,12 @@ export function hitTestGutter(
   const lineNumberMap = gutter.lineNumberMap.value
   const blockStarts = gutter.blockStarts.value
 
+  const visibleTop = -paddingTop
   const visibleBottom = canvas.size.height.value - headerHeight - paddingTop
-  for (const visualLine of visualLines) {
+  const startIndex = lowerBoundVisualLineBottomAtLeast(visualLines, visibleTop - scrollY)
+  for (let i = startIndex; i < visualLines.length; i++) {
+    const visualLine = visualLines[i]
     const lineY = visualLine.y + scrollY
-    if (lineY + visualLine.height + paddingTop < 0) continue
     if (shouldBreakBottom(visualLines, visualLine, lineY, visibleBottom, scrollY)) break
 
     if (relativeY >= lineY && relativeY < lineY + visualLine.height) {
