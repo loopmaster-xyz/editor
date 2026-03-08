@@ -7,6 +7,7 @@ import type { Caret } from './caret.ts'
 import type { Doc, DocError } from './doc.ts'
 import { hitTestGutter } from './draw/gutter.ts'
 import { hitTestScrollbar } from './draw/scrollbar.ts'
+import { getAboveHeight } from './draw/widget.ts'
 import type { Gutter } from './gutter.ts'
 import type { Header } from './header.ts'
 import { signalify } from './lib/signalify.ts'
@@ -19,7 +20,6 @@ import {
   getColumnFromVisualPosition,
   getXFromColumn,
   getXFromColumnUnclamped,
-  isLineEmpty,
 } from './line-utils.ts'
 import type { Lines, VisualLine, VisualToken } from './lines.ts'
 import { createOverlayCanvas } from './overlay-canvas.ts'
@@ -32,6 +32,117 @@ import type { Token } from './token.ts'
 import type { Widget } from './widget.ts'
 
 export type Mouse = ReturnType<typeof createMouse>
+
+function lowerBoundVisualLineBottom(visualLines: VisualLine[], worldY: number): number {
+  let low = 0
+  let high = visualLines.length
+
+  while (low < high) {
+    const mid = (low + high) >> 1
+    const line = visualLines[mid]
+    if (line.y + line.height <= worldY) {
+      low = mid + 1
+    }
+    else {
+      high = mid
+    }
+  }
+
+  return low
+}
+
+function lowerBoundVisualLineStart(visualLines: VisualLine[], worldY: number): number {
+  let low = 0
+  let high = visualLines.length
+
+  while (low < high) {
+    const mid = (low + high) >> 1
+    const line = visualLines[mid]
+    if (line.y < worldY) {
+      low = mid + 1
+    }
+    else {
+      high = mid
+    }
+  }
+
+  return low
+}
+
+function findVisualLineAtWorldY(visualLines: VisualLine[], worldY: number): VisualLine | null {
+  const index = lowerBoundVisualLineBottom(visualLines, worldY)
+  if (index < 0 || index >= visualLines.length) return null
+  const line = visualLines[index]
+  if (worldY >= line.y && worldY < line.y + line.height) return line
+  return null
+}
+
+function findNearestVisualLineAtWorldY(visualLines: VisualLine[], worldY: number): VisualLine | null {
+  if (visualLines.length === 0) return null
+
+  const containing = findVisualLineAtWorldY(visualLines, worldY)
+  if (containing) return containing
+
+  const insertionIndex = lowerBoundVisualLineBottom(visualLines, worldY)
+  if (insertionIndex <= 0) return visualLines[0]
+  if (insertionIndex >= visualLines.length) return visualLines[visualLines.length - 1]
+
+  const before = visualLines[insertionIndex - 1]
+  const after = visualLines[insertionIndex]
+  const beforeDistance = Math.abs(worldY - (before.y + before.height / 2))
+  const afterDistance = Math.abs(worldY - (after.y + after.height / 2))
+  return beforeDistance <= afterDistance ? before : after
+}
+
+function moveTokenPosition(tokenLines: Token[][], lineIndex: number, tokenIndex: number, delta: number): {
+  lineIndex: number
+  tokenIndex: number
+} | null
+{
+  if (delta === 0) return { lineIndex, tokenIndex }
+
+  let line = lineIndex
+  let token = tokenIndex
+
+  if (delta > 0) {
+    for (let i = 0; i < delta; i++) {
+      token++
+      while (line < tokenLines.length && token >= (tokenLines[line]?.length ?? 0)) {
+        line++
+        token = 0
+      }
+      if (line >= tokenLines.length) return null
+    }
+    return { lineIndex: line, tokenIndex: token }
+  }
+
+  for (let i = 0; i < -delta; i++) {
+    token--
+    while (line >= 0 && token < 0) {
+      line--
+      if (line < 0) return null
+      token = (tokenLines[line]?.length ?? 0) - 1
+    }
+    if (line < 0) return null
+  }
+
+  return { lineIndex: line, tokenIndex: token }
+}
+
+function findCallBlockTokenPositionFromAnchor(
+  tokenLines: Token[][],
+  callBlock: Token[],
+  anchorLine: number,
+  anchorTokenIndex: number,
+  anchorToken: Token,
+  targetToken: Token,
+): { lineIndex: number; tokenIndex: number } | null
+{
+  const anchorBlockIndex = callBlock.indexOf(anchorToken)
+  const targetBlockIndex = callBlock.indexOf(targetToken)
+  if (anchorBlockIndex < 0 || targetBlockIndex < 0) return null
+  return moveTokenPosition(tokenLines, anchorLine, anchorTokenIndex, targetBlockIndex - anchorBlockIndex)
+}
 
 function findCallBlock(tokenLines: Token[][], lineIndex: number, tokenIndex: number): Token[] {
   const line = tokenLines[lineIndex]
@@ -463,25 +574,10 @@ export function createMouse(
     const worldY = y - headerHeight - settings.paddingTop - scrollY
     const worldX = x - settings.paddingLeft - gutter.width.value - scrollX
 
-    let foundLine: VisualLine | null = null
-    let minDistance = Infinity
-
-    for (const line of visualLines) {
-      if (worldY >= line.y && worldY < line.y + line.height) {
-        foundLine = line
-        break
-      }
-      const lineCenterY = line.y + line.height / 2
-      const distance = Math.abs(worldY - lineCenterY)
-      if (distance < minDistance) {
-        minDistance = distance
-        foundLine = line
-      }
-    }
+    let foundLine = findNearestVisualLineAtWorldY(visualLines, worldY)
 
     if (!foundLine) {
-      if (visualLines.length === 0) return null
-      foundLine = worldY < 0 ? visualLines[0] : visualLines[visualLines.length - 1]
+      return null
     }
 
     const codeLines = doc.lines
@@ -501,18 +597,7 @@ export function createMouse(
   }
 
   const getAboveHeightForLine = (line: VisualLine): number => {
-    if (line.widgets.above.length === 0) return 0
-    const visualLines = lines.visualLines.value
-    const firstIndex = visualLines.findIndex(l => l.logicalLine === line.logicalLine && l.tokenOffset === 0)
-    if (firstIndex === -1) return 0
-    let emptyHeight = 0
-    for (let i = firstIndex - 1; i >= 0; i--) {
-      const prev = visualLines[i]
-      if (prev.logicalLine >= line.logicalLine) continue
-      if (isLineEmpty(prev)) emptyHeight += prev.height
-      else break
-    }
-    return emptyHeight
+    return getAboveHeight(lines.visualLines.value, line)
   }
 
   const findBelowWidgetHit = (x: number, y: number): { widget: Widget & { type: 'below' }; canvasX: number;
@@ -527,13 +612,7 @@ export function createMouse(
     const tokenLines = doc.tokenLines
     const { lineHeight } = settings
 
-    let foundLine: VisualLine | null = null
-    for (const line of visualLines) {
-      if (worldY >= line.y && worldY < line.y + line.height) {
-        foundLine = line
-        break
-      }
-    }
+    const foundLine = findVisualLineAtWorldY(visualLines, worldY)
     if (!foundLine || foundLine.widgets.below.length === 0) return null
     if (worldY < foundLine.y + lineHeight || worldY >= foundLine.y + foundLine.height) return null
 
@@ -577,13 +656,7 @@ export function createMouse(
     const tokenLines = doc.tokenLines
     const { lineHeight } = settings
 
-    let foundLine: VisualLine | null = null
-    for (const line of visualLines) {
-      if (worldY >= line.y && worldY < line.y + line.height) {
-        foundLine = line
-        break
-      }
-    }
+    const foundLine = findVisualLineAtWorldY(visualLines, worldY)
     if (!foundLine || foundLine.widgets.beforeAfter.length === 0) return null
 
     const contentY = foundLine.tokenOffset === 0 ? foundLine.y : foundLine.y + getAboveHeightForLine(foundLine)
@@ -693,13 +766,7 @@ export function createMouse(
       const worldX = hit.worldX
       const worldY = hit.worldY
 
-      let foundLine: VisualLine | null = null
-      for (const line of visualLines) {
-        if (worldY >= line.y && worldY < line.y + line.height) {
-          foundLine = line
-          break
-        }
-      }
+      const foundLine = findVisualLineAtWorldY(visualLines, worldY)
 
       if (!foundLine) {
         hovered.line = null
@@ -822,7 +889,8 @@ export function createMouse(
               if (parameterIndex >= 0) {
                 const paramStartToken = getParameterStartToken(callBlock, parameterIndex)
                 if (paramStartToken) {
-                  const pos = findTokenPositionInTokenLines(tokenLines, paramStartToken)
+                  const pos = findCallBlockTokenPositionFromAnchor(tokenLines, callBlock, logicalLine, logicalTokenIndex,
+                    foundToken.token, paramStartToken)
                   if (pos) {
                     const lineTokens = tokenLines[pos.lineIndex] || []
                     const column = getColumnForTokenIndex(lineTokens, pos.tokenIndex)
@@ -842,24 +910,33 @@ export function createMouse(
               let callBlockX = tokenX
               let callBlockY = tokenY
               if (callBlock.length > 0) {
-                const lineTokens = tokenLines[logicalLine] || []
-                let functionTokenIndex = -1
+                let functionToken: Token | null = null
                 for (let i = 0; i < callBlock.length; i++) {
                   const token = callBlock[i]
                   if (token.text === '(' && i > 0) {
                     const prevToken = callBlock[i - 1]
                     if (prevToken && (prevToken.type === 'function' || prevToken.type === 'identifier')) {
-                      functionTokenIndex = lineTokens.indexOf(prevToken)
+                      functionToken = prevToken
                       break
                     }
                   }
                 }
-                if (functionTokenIndex >= 0) {
-                  for (const visualToken of foundLine.tokens) {
-                    if (visualToken.logicalTokenIndex === functionTokenIndex) {
-                      callBlockX = visualToken.x + gutter.width.value + settings.paddingLeft + scrollX + canvasRect.left
-                      callBlockY = contentY + headerHeight + settings.paddingTop + scrollY + canvasRect.top
-                      break
+                if (functionToken) {
+                  const functionPos = findCallBlockTokenPositionFromAnchor(tokenLines, callBlock, logicalLine,
+                    logicalTokenIndex, foundToken.token, functionToken)
+                  if (functionPos) {
+                    const functionLineTokens = tokenLines[functionPos.lineIndex] || []
+                    const functionColumn = getColumnForTokenIndex(functionLineTokens, functionPos.tokenIndex)
+                    const functionLine = findVisualLineForColumn(lines, functionPos.lineIndex, functionColumn, tokenLines,
+                      caches)
+                    if (functionLine) {
+                      const functionX = getXFromColumn(lines, functionLine, functionColumn, tokenLines, canvas, settings,
+                        caches)
+                      const functionContentY = functionLine.tokenOffset === 0
+                        ? functionLine.y
+                        : functionLine.y + getAboveHeightForLine(functionLine)
+                      callBlockX = functionX + gutter.width.value + settings.paddingLeft + scrollX + canvasRect.left
+                      callBlockY = functionContentY + headerHeight + settings.paddingTop + scrollY + canvasRect.top
                     }
                   }
                 }
@@ -1107,7 +1184,9 @@ export function createMouse(
           const maxCaretY = canvasHeight - settings.lineHeight
 
           let targetLine: VisualLine | null = null
-          for (const line of visualLines) {
+          const firstVisibleIndex = lowerBoundVisualLineBottom(visualLines, -scrollY)
+          for (let i = firstVisibleIndex; i < visualLines.length; i++) {
+            const line = visualLines[i]
             const lineY = line.y + scrollY
             if (lineY <= maxCaretY && lineY + line.height > 0) {
               targetLine = line
@@ -1163,14 +1242,8 @@ export function createMouse(
           const scrollY = scroll.pos.y
           const scrollX = scroll.pos.x
 
-          let targetLine: VisualLine | null = null
-          for (const line of visualLines) {
-            const lineY = line.y + scrollY
-            if (lineY >= 0 && lineY + line.height > 0) {
-              targetLine = line
-              break
-            }
-          }
+          const firstAtOrBelowTop = lowerBoundVisualLineStart(visualLines, -scrollY)
+          const targetLine = firstAtOrBelowTop < visualLines.length ? visualLines[firstAtOrBelowTop] : null
 
           if (targetLine && lastMouseX !== null) {
             const logicalLine = targetLine.logicalLine

@@ -5,7 +5,7 @@ import { HORIZONTAL_SCROLLBAR_SIZE, VERTICAL_SCROLLBAR_SIZE } from './draw/scrol
 import type { Gutter } from './gutter.ts'
 import type { Header } from './header.ts'
 import { signalify } from './lib/signalify.ts'
-import type { Lines } from './lines.ts'
+import type { Lines, VisualLine } from './lines.ts'
 import type { Metrics } from './metrics.ts'
 import type { Settings } from './settings.ts'
 
@@ -14,6 +14,24 @@ export const SCROLL_SMOOTH_SCROLLING = 0.4
 export const SCROLL_SMOOTH_THRESHOLD = 0.1
 
 export type Scroll = ReturnType<typeof createScroll>
+
+function lowerBoundVisualLineBottomAtLeast(visualLines: VisualLine[], minBottomY: number): number {
+  let low = 0
+  let high = visualLines.length
+
+  while (low < high) {
+    const mid = (low + high) >> 1
+    const line = visualLines[mid]
+    if (line.y + line.height < minBottomY) {
+      low = mid + 1
+    }
+    else {
+      high = mid
+    }
+  }
+
+  return low
+}
 
 export function createScroll(canvas: Canvas, lines: Lines, settings: Settings, gutter: Gutter, header: Signal<Header>,
   metrics: Metrics)
@@ -81,11 +99,19 @@ export function createScroll(canvas: Canvas, lines: Lines, settings: Settings, g
     const headerHeight = header.value?.height ?? 0
     const visibleTop = -headerHeight - settings.paddingTop
     const visibleBottom = canvas.size.height.value - settings.paddingTop
+    const visibleTopInContentSpace = visibleTop - scrollY
+    const startIndex = lowerBoundVisualLineBottomAtLeast(visualLines, visibleTopInContentSpace)
+    if (startIndex >= visualLines.length) {
+      metrics.visibleLines.value = { start: 0, end: 0 }
+      return
+    }
+
     let start: number | null = null
     let end: number | null = null
-    for (const line of visualLines) {
+
+    for (let i = startIndex; i < visualLines.length; i++) {
+      const line = visualLines[i]
       const lineY = line.y + scrollY
-      if (lineY + line.height < visibleTop) continue
       if (shouldBreakBottom(visualLines, line, lineY, visibleBottom, scrollY)) break
       const logicalLine = line.logicalLine
       if (start === null) {
