@@ -31,6 +31,27 @@ interface BraceCache {
   braces: BraceInfo[]
   matchedPairs: { openIndex: number; closeIndex: number; depth: number }[]
   lineLengths: number[]
+  lineStartPositions: number[]
+  pairEntries: PairEntry[]
+  coverageSegments: CoverageSegment[]
+}
+
+interface PairEntry {
+  id: number
+  openIndex: number
+  closeIndex: number
+  depth: number
+  openStart: number
+  openEnd: number
+  closeStart: number
+  closeEnd: number
+  range: number
+}
+
+interface CoverageSegment {
+  start: number
+  end: number
+  pairEntryIndex: number
 }
 
 const openingBraces = new Set(['{', '(', '['])
@@ -38,6 +59,70 @@ const closingBraces = new Set(['}', ')', ']'])
 const quoteChars = new Set(["'", '"', '`'])
 
 const braceCache = new WeakMap<Token[][], BraceCache>()
+
+function comparePairPriority(a: number, b: number, pairEntries: PairEntry[]): number {
+  const aPair = pairEntries[a]
+  const bPair = pairEntries[b]
+  if (aPair.range !== bPair.range) return aPair.range - bPair.range
+  return aPair.id - bPair.id
+}
+
+function pushMinHeap(heap: number[], value: number, pairEntries: PairEntry[]) {
+  heap.push(value)
+  let index = heap.length - 1
+  while (index > 0) {
+    const parent = (index - 1) >> 1
+    if (comparePairPriority(heap[index], heap[parent], pairEntries) >= 0) break
+    const tmp = heap[parent]
+    heap[parent] = heap[index]
+    heap[index] = tmp
+    index = parent
+  }
+}
+
+function popMinHeap(heap: number[], pairEntries: PairEntry[]): number | undefined {
+  if (heap.length === 0) return undefined
+  const top = heap[0]
+  const last = heap.pop()
+  if (heap.length === 0 || last === undefined) return top
+  heap[0] = last
+
+  let index = 0
+  while (true) {
+    const left = index * 2 + 1
+    const right = left + 1
+    let smallest = index
+
+    if (left < heap.length && comparePairPriority(heap[left], heap[smallest], pairEntries) < 0) {
+      smallest = left
+    }
+    if (right < heap.length && comparePairPriority(heap[right], heap[smallest], pairEntries) < 0) {
+      smallest = right
+    }
+    if (smallest === index) break
+
+    const tmp = heap[index]
+    heap[index] = heap[smallest]
+    heap[smallest] = tmp
+    index = smallest
+  }
+
+  return top
+}
+
+function peekMinHeap(heap: number[]): number | undefined {
+  return heap.length > 0 ? heap[0] : undefined
+}
+
+function getBestActivePairIndex(heap: number[], active: boolean[], pairEntries: PairEntry[]): number | null {
+  while (heap.length > 0) {
+    const top = peekMinHeap(heap)
+    if (top === undefined) return null
+    if (active[top]) return top
+    popMinHeap(heap, pairEntries)
+  }
+  return null
+}
 
 function getMatchingOpenBrace(closeChar: string): string {
   switch (closeChar) {
@@ -64,10 +149,13 @@ function buildBraceCache(tokenLines: Token[][]): BraceCache {
 
   const braces: BraceInfo[] = []
   const lineLengths: number[] = []
+  const lineStartPositions: number[] = new Array(tokenLines.length + 1).fill(0)
   let inString: string | null = null
+  let globalPos = 0
 
   for (let lineIndex = 0; lineIndex < tokenLines.length; lineIndex++) {
     const line = tokenLines[lineIndex]
+    lineStartPositions[lineIndex] = globalPos
     let currentColumn = 0
     let lineLength = 0
 
@@ -132,7 +220,9 @@ function buildBraceCache(tokenLines: Token[][]): BraceCache {
     }
 
     lineLengths.push(lineLength)
+    globalPos += lineLength + 1
   }
+  lineStartPositions[tokenLines.length] = globalPos
 
   const matchedPairs: { openIndex: number; closeIndex: number; depth: number }[] = []
   const stack: { char: string; index: number; depth: number }[] = []
@@ -162,7 +252,85 @@ function buildBraceCache(tokenLines: Token[][]): BraceCache {
     }
   }
 
-  const cache: BraceCache = { braces, matchedPairs, lineLengths }
+  const pairEntries: PairEntry[] = matchedPairs.map((pair, id) => {
+    const openBrace = braces[pair.openIndex]
+    const closeBrace = braces[pair.closeIndex]
+    const openStart = (lineStartPositions[openBrace.line] ?? 0) + openBrace.position
+    const closeStart = (lineStartPositions[closeBrace.line] ?? 0) + closeBrace.position
+    const openEnd = openStart + 1
+    const closeEnd = closeStart + 1
+
+    return {
+      id,
+      openIndex: pair.openIndex,
+      closeIndex: pair.closeIndex,
+      depth: pair.depth,
+      openStart,
+      openEnd,
+      closeStart,
+      closeEnd,
+      range: closeEnd - openStart,
+    }
+  })
+
+  const events = new Map<number, { add: number[]; remove: number[] }>()
+  const getOrCreateEvents = (pos: number) => {
+    let event = events.get(pos)
+    if (!event) {
+      event = { add: [], remove: [] }
+      events.set(pos, event)
+    }
+    return event
+  }
+
+  for (let i = 0; i < pairEntries.length; i++) {
+    const pairEntry = pairEntries[i]
+    getOrCreateEvents(pairEntry.openStart).add.push(i)
+    getOrCreateEvents(pairEntry.closeEnd + 1).remove.push(i)
+  }
+
+  const eventPositions = Array.from(events.keys()).sort((a, b) => a - b)
+  const active = new Array<boolean>(pairEntries.length).fill(false)
+  const heap: number[] = []
+  const coverageSegments: CoverageSegment[] = []
+
+  for (let i = 0; i < eventPositions.length; i++) {
+    const pos = eventPositions[i]
+    const event = events.get(pos)
+    if (!event) continue
+
+    for (const pairIndex of event.remove) {
+      active[pairIndex] = false
+    }
+    for (const pairIndex of event.add) {
+      active[pairIndex] = true
+      pushMinHeap(heap, pairIndex, pairEntries)
+    }
+
+    const nextPos = eventPositions[i + 1]
+    if (nextPos === undefined) continue
+
+    const bestPairIndex = getBestActivePairIndex(heap, active, pairEntries)
+    if (bestPairIndex === null) continue
+
+    const segmentStart = pos
+    const segmentEnd = nextPos - 1
+    if (segmentEnd < segmentStart) continue
+
+    const prev = coverageSegments[coverageSegments.length - 1]
+    if (prev && prev.pairEntryIndex === bestPairIndex && prev.end + 1 === segmentStart) {
+      prev.end = segmentEnd
+    }
+    else {
+      coverageSegments.push({
+        start: segmentStart,
+        end: segmentEnd,
+        pairEntryIndex: bestPairIndex,
+      })
+    }
+  }
+
+  const cache: BraceCache = { braces, matchedPairs, lineLengths, lineStartPositions, pairEntries, coverageSegments }
   braceCache.set(tokenLines, cache)
   return cache
 }
@@ -221,6 +389,29 @@ function upperBound(sorted: number[], target: number): number {
   }
 
   return low
+}
+
+function findCoverageSegment(
+  coverageSegments: CoverageSegment[],
+  pos: number,
+): CoverageSegment | null {
+  let low = 0
+  let high = coverageSegments.length
+
+  while (low < high) {
+    const mid = (low + high) >> 1
+    if (coverageSegments[mid].start <= pos) {
+      low = mid + 1
+    }
+    else {
+      high = mid
+    }
+  }
+
+  const index = low - 1
+  if (index < 0) return null
+  const segment = coverageSegments[index]
+  return pos <= segment.end ? segment : null
 }
 
 export function createBlocks(doc: Doc, caches: Caches) {
@@ -483,52 +674,24 @@ export function createBlocks(doc: Doc, caches: Caches) {
 
     const tokenLines = doc.tokenLines
     const cache = buildBraceCache(tokenLines)
-    const { braces, matchedPairs, lineLengths } = cache
+    const { braces, pairEntries, coverageSegments, lineStartPositions } = cache
 
-    if (braces.length === 0 || matchedPairs.length === 0) {
+    if (braces.length === 0 || pairEntries.length === 0 || coverageSegments.length === 0) {
       caches.matchingBraceCache.set(cacheKey, null)
       return null
     }
 
-    const clampedCursorLine = Math.max(0, Math.min(cursorLine, tokenLines.length))
-    let cursorGlobalPos = 0
-    for (let i = 0; i < clampedCursorLine; i++) {
-      cursorGlobalPos += lineLengths[i] + 1
-    }
-    cursorGlobalPos += cursorColumn
-
-    let innermostPair: { openIndex: number; closeIndex: number; depth: number } | null = null
-    let smallestRange = Infinity
-
-    for (const pair of matchedPairs) {
-      const openBrace = braces[pair.openIndex]
-      const closeBrace = braces[pair.closeIndex]
-
-      const openStart = getBraceGlobalPos(openBrace)
-      const closeStart = getBraceGlobalPos(closeBrace)
-      const openEnd = openStart + 1
-      const closeEnd = closeStart + 1
-
-      const isCursorInside = cursorGlobalPos > openStart && cursorGlobalPos < closeEnd
-      const touchesOpenBrace = cursorGlobalPos === openStart || cursorGlobalPos === openEnd
-      const touchesCloseBrace = cursorGlobalPos === closeStart || cursorGlobalPos === closeEnd
-
-      if (isCursorInside || touchesOpenBrace || touchesCloseBrace) {
-        const range = closeEnd - openStart
-        if (range < smallestRange) {
-          smallestRange = range
-          innermostPair = pair
-        }
-      }
-    }
-
-    if (!innermostPair) {
+    const clampedCursorLine = Math.max(0, Math.min(cursorLine, lineStartPositions.length - 1))
+    const cursorGlobalPos = (lineStartPositions[clampedCursorLine] ?? 0) + cursorColumn
+    const coverageSegment = findCoverageSegment(coverageSegments, cursorGlobalPos)
+    if (!coverageSegment) {
       caches.matchingBraceCache.set(cacheKey, null)
       return null
     }
 
-    const openBrace = braces[innermostPair.openIndex]
-    const closeBrace = braces[innermostPair.closeIndex]
+    const pairEntry = pairEntries[coverageSegment.pairEntryIndex]
+    const openBrace = braces[pairEntry.openIndex]
+    const closeBrace = braces[pairEntry.closeIndex]
 
     const result: MatchingBrace = {
       line: openBrace.line,
@@ -539,7 +702,7 @@ export function createBlocks(doc: Doc, caches: Caches) {
       matchingTokenIndex: closeBrace.tokenIndex,
       matchingToken: closeBrace.token,
       matchingCharIndex: closeBrace.charIndex,
-      depth: innermostPair.depth,
+      depth: pairEntry.depth,
     }
 
     caches.matchingBraceCache.set(cacheKey, result)

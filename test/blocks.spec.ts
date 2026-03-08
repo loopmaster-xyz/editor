@@ -93,3 +93,52 @@ describe('block navigation index', () => {
     expect(single.getParentBlockStart(0)).toBeNull()
   })
 })
+
+describe('matching brace lookup index', () => {
+  it('returns innermost pair for nested same-line braces', () => {
+    const blocks = createBlocksForCode('x(a(b))')
+    const match = blocks.findMatchingBrace(0, 4)
+    expect(match).not.toBeNull()
+    expect(match?.line).toBe(0)
+    expect(match?.charIndex).toBe(3)
+    expect(match?.matchingLine).toBe(0)
+    expect(match?.matchingCharIndex).toBe(5)
+  })
+
+  it('matches when cursor touches brace boundaries', () => {
+    const blocks = createBlocksForCode('x(a(b))')
+    const match = blocks.findMatchingBrace(0, 6)
+    expect(match).not.toBeNull()
+    expect(match?.line).toBe(0)
+    expect(match?.charIndex).toBe(3)
+    expect(match?.matchingLine).toBe(0)
+    expect(match?.matchingCharIndex).toBe(5)
+  })
+
+  it('matches multiline outer and inner brace pairs', () => {
+    const blocks = createBlocksForCode([
+      'if (x) {',
+      '  foo(bar)',
+      '}',
+    ].join('\n'))
+
+    const inner = blocks.findMatchingBrace(1, 7)
+    expect(inner).not.toBeNull()
+    expect(inner?.line).toBe(1)
+    expect(inner?.charIndex).toBe(5)
+    expect(inner?.matchingLine).toBe(1)
+    expect(inner?.matchingCharIndex).toBe(9)
+
+    const outer = blocks.findMatchingBrace(1, 0)
+    expect(outer).not.toBeNull()
+    expect(outer?.line).toBe(0)
+    expect(outer?.charIndex).toBe(7)
+    expect(outer?.matchingLine).toBe(2)
+    expect(outer?.matchingCharIndex).toBe(0)
+  })
+
+  it('returns null when cursor is outside all brace ranges', () => {
+    const blocks = createBlocksForCode('abc')
+    expect(blocks.findMatchingBrace(0, 1)).toBeNull()
+  })
+})
