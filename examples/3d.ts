@@ -1,7 +1,7 @@
 import { batch } from '@preact/signals-core'
 import { createDoc, createEditor, draw } from '../src/editor.ts'
 import type { Settings } from '../src/settings.ts'
-import { tokenize } from './tokenizer.ts'
+import { tokenizer } from './tokenizer.ts'
 
 const editorSettings: Partial<Settings> = {
   wordWrap: false,
@@ -121,7 +121,7 @@ for (let row = 0; row < gridRows; row++) {
   docs[row] = []
   for (let col = 0; col < gridCols; col++) {
     const ed = createEditor(editorSettings)
-    const doc = createDoc(tokenize)
+    const doc = createDoc(tokenizer)
     doc.code = `// cell ${row},${col}\n${createDoc.toString()}`
     ed.setDoc(doc)
     batch(() => {

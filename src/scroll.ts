@@ -1,11 +1,10 @@
 import { batch, computed, effect, type Signal, signal, untracked } from '@preact/signals-core'
 import type { Canvas } from './canvas.ts'
-import { shouldBreakBottom } from './draw/widget.ts'
 import { HORIZONTAL_SCROLLBAR_SIZE, VERTICAL_SCROLLBAR_SIZE } from './draw/scrollbar.ts'
 import type { Gutter } from './gutter.ts'
 import type { Header } from './header.ts'
 import { signalify } from './lib/signalify.ts'
-import type { Lines, VisualLine } from './lines.ts'
+import type { Lines } from './lines.ts'
 import type { Metrics } from './metrics.ts'
 import type { Settings } from './settings.ts'
 
@@ -14,24 +13,6 @@ export const SCROLL_SMOOTH_SCROLLING = 0.4
 export const SCROLL_SMOOTH_THRESHOLD = 0.1
 
 export type Scroll = ReturnType<typeof createScroll>
-
-function lowerBoundVisualLineBottomAtLeast(visualLines: VisualLine[], minBottomY: number): number {
-  let low = 0
-  let high = visualLines.length
-
-  while (low < high) {
-    const mid = (low + high) >> 1
-    const line = visualLines[mid]
-    if (line.y + line.height < minBottomY) {
-      low = mid + 1
-    }
-    else {
-      high = mid
-    }
-  }
-
-  return low
-}
 
 export function createScroll(canvas: Canvas, lines: Lines, settings: Settings, gutter: Gutter, header: Signal<Header>,
   metrics: Metrics)
@@ -90,18 +71,19 @@ export function createScroll(canvas: Canvas, lines: Lines, settings: Settings, g
       metrics.visibleLines.value = { start: 0, end: 0 }
       return
     }
-    const visualLines = untracked(() => lines.visualLines.value)
-    if (visualLines.length === 0) {
-      metrics.visibleLines.value = { start: 0, end: 0 }
-      return
-    }
     const scrollY = pos.y
     const headerHeight = header.value?.height ?? 0
     const visibleTop = -headerHeight - settings.paddingTop
     const visibleBottom = canvas.size.height.value - settings.paddingTop
-    const visibleTopInContentSpace = visibleTop - scrollY
-    const startIndex = lowerBoundVisualLineBottomAtLeast(visualLines, visibleTopInContentSpace)
-    if (startIndex >= visualLines.length) {
+    const approxVisibleRange = typeof lines.getApproxVisibleLogicalRange === 'function'
+      ? lines.getApproxVisibleLogicalRange(visibleTop, visibleBottom, scrollY)
+      : null
+    if (approxVisibleRange) {
+      metrics.visibleLines.value = approxVisibleRange
+      return
+    }
+    const visualLines = untracked(() => lines.getVisibleVisualLines(visibleTop, visibleBottom, scrollY))
+    if (visualLines.length === 0) {
       metrics.visibleLines.value = { start: 0, end: 0 }
       return
     }
@@ -109,10 +91,8 @@ export function createScroll(canvas: Canvas, lines: Lines, settings: Settings, g
     let start: number | null = null
     let end: number | null = null
 
-    for (let i = startIndex; i < visualLines.length; i++) {
+    for (let i = 0; i < visualLines.length; i++) {
       const line = visualLines[i]
-      const lineY = line.y + scrollY
-      if (shouldBreakBottom(visualLines, line, lineY, visibleBottom, scrollY)) break
       const logicalLine = line.logicalLine
       if (start === null) {
         start = logicalLine
@@ -130,15 +110,35 @@ export function createScroll(canvas: Canvas, lines: Lines, settings: Settings, g
     if (pos.x === Infinity || pos.y === Infinity) {
       return
     }
-    if (targetX.value < scrollWidth.value) {
-      targetX.value = scrollWidth.value
+
+    const approxContentMetrics = typeof lines.getApproxContentMetrics === 'function'
+      ? lines.getApproxContentMetrics()
+      : null
+    if (!approxContentMetrics) {
+      return
+    }
+
+    const headerHeight = header.value?.height ?? 0
+    const needsVertical = approxContentMetrics.totalHeight
+      > canvas.size.height.value - headerHeight - settings.paddingTop - settings.paddingBottom
+    const availableWidth = canvas.size.width.value - settings.paddingLeft - settings.paddingRight - gutter.width.value
+      - (needsVertical ? VERTICAL_SCROLLBAR_SIZE : 0)
+    const minScrollX = settings.wordWrap ? 0 : Math.min(0, -approxContentMetrics.totalWidth + availableWidth)
+
+    const needsHorizontal = !settings.wordWrap && approxContentMetrics.totalWidth > availableWidth
+    const availableHeight = canvas.size.height.value - headerHeight - settings.paddingTop - settings.paddingBottom
+      - (needsHorizontal ? HORIZONTAL_SCROLLBAR_SIZE : 0)
+    const minScrollY = Math.min(0, -approxContentMetrics.totalHeight + availableHeight)
+
+    if (targetX.value < minScrollX) {
+      targetX.value = minScrollX
     }
     if (targetX.value > 0) {
       targetX.value = 0
     }
 
-    if (targetY.value < scrollHeight.value) {
-      targetY.value = scrollHeight.value
+    if (targetY.value < minScrollY) {
+      targetY.value = minScrollY
     }
     if (targetY.value > 0) {
       targetY.value = 0

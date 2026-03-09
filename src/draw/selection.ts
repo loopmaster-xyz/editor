@@ -41,7 +41,7 @@ export function drawSelection(context: Context) {
   for (let logicalLine = startLine; logicalLine <= endLine; logicalLine++) {
     if (logicalLine < 0 || logicalLine >= codeLines.length) continue
 
-    const visualLines = lines.visualLinesByLogicalLine.value.get(logicalLine) ?? []
+    const visualLines = lines.visualLinesByLogicalLine.value[logicalLine] ?? []
     if (!visualLines.length) continue
 
     let prevVisualBottom: number | null = null
@@ -212,7 +212,7 @@ export function drawSelection(context: Context) {
 
       if (hasAbove && isFirst) {
         const pl = logicalLine - 1
-        const pv = lines.visualLinesByLogicalLine.value.get(pl) ?? []
+        const pv = lines.visualLinesByLogicalLine.value[pl] ?? []
         if (pv.length) {
           const lv = pv[pv.length - 1]
           const ps = getCharOffsetForVisualLine(pl, lv, tokenLines, lines)
@@ -243,7 +243,7 @@ export function drawSelection(context: Context) {
 
       if (hasBelow && isLast) {
         const nl = logicalLine + 1
-        const nv = lines.visualLinesByLogicalLine.value.get(nl) ?? []
+        const nv = lines.visualLinesByLogicalLine.value[nl] ?? []
         if (nv.length) {
           const fv = nv[0]
           const ns = getCharOffsetForVisualLine(nl, fv, tokenLines, lines)

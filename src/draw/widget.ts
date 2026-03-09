@@ -5,46 +5,28 @@ import { measureText } from '../measure.ts'
 import type { Widget } from '../widget.ts'
 import { VERTICAL_SCROLLBAR_SIZE } from './scrollbar.ts'
 
-type AboveHeightIndex = {
-  aboveHeightByLine: Map<VisualLine, number>
-  logicalAboveHeightByLine: Map<number, number>
-  visualLineIndexByLine: Map<VisualLine, number>
-  nextAboveWidgetStartIndexByLineIndex: number[]
+const hasAboveWidgetStartCache = new WeakMap<VisualLine[], boolean>()
+const nextAboveWidgetStartIndexCache = new WeakMap<VisualLine[], number[]>()
+const fallbackLogicalAboveHeightCache = new WeakMap<VisualLine[], Map<number, number>>()
+
+function hasAnyAboveWidgetStart(visualLines: VisualLine[]): boolean {
+  const cached = hasAboveWidgetStartCache.get(visualLines)
+  if (cached !== undefined) return cached
+
+  let has = false
+  for (let i = 0; i < visualLines.length; i++) {
+    const line = visualLines[i]
+    if (line.tokenOffset === 0 && line.widgets.above.length > 0) {
+      has = true
+      break
+    }
+  }
+  hasAboveWidgetStartCache.set(visualLines, has)
+  return has
 }
 
-const aboveHeightIndexCache = new WeakMap<VisualLine[], AboveHeightIndex>()
-
-function buildAboveHeightIndex(visualLines: VisualLine[]): AboveHeightIndex {
-  const aboveHeightByLine = new Map<VisualLine, number>()
-  const logicalAboveHeightByLine = new Map<number, number>()
-  const visualLineIndexByLine = new Map<VisualLine, number>()
+function buildNextAboveWidgetStartIndex(visualLines: VisualLine[]): number[] {
   const nextAboveWidgetStartIndexByLineIndex = new Array<number>(visualLines.length).fill(-1)
-  let consecutiveEmptyHeight = 0
-
-  for (let i = 0; i < visualLines.length; i++) {
-    const line = visualLines[i]
-    visualLineIndexByLine.set(line, i)
-
-    if (line.tokenOffset === 0 && !logicalAboveHeightByLine.has(line.logicalLine)) {
-      logicalAboveHeightByLine.set(line.logicalLine, consecutiveEmptyHeight)
-    }
-
-    if (isLineEmpty(line)) {
-      consecutiveEmptyHeight += line.height
-    }
-    else {
-      consecutiveEmptyHeight = 0
-    }
-  }
-
-  for (let i = 0; i < visualLines.length; i++) {
-    const line = visualLines[i]
-    const logicalAboveHeight = logicalAboveHeightByLine.get(line.logicalLine) ?? 0
-    aboveHeightByLine.set(line, line.widgets.above.length > 0 ? logicalAboveHeight : 0)
-  }
-
-  // Precompute the next logical-line start that has above widgets for each index.
-  // This keeps shouldBreakBottom() O(1) in the empty-line path.
   let nextAboveWidgetStart = -1
   for (let i = visualLines.length - 1; i >= 0; i--) {
     nextAboveWidgetStartIndexByLineIndex[i] = nextAboveWidgetStart
@@ -53,50 +35,58 @@ function buildAboveHeightIndex(visualLines: VisualLine[]): AboveHeightIndex {
       nextAboveWidgetStart = i
     }
   }
-
-  return {
-    aboveHeightByLine,
-    logicalAboveHeightByLine,
-    visualLineIndexByLine,
-    nextAboveWidgetStartIndexByLineIndex,
-  }
+  return nextAboveWidgetStartIndexByLineIndex
 }
 
-function getAboveHeightIndex(visualLines: VisualLine[]): AboveHeightIndex {
-  const cached = aboveHeightIndexCache.get(visualLines)
+function getNextAboveWidgetStartIndexArray(visualLines: VisualLine[]): number[] {
+  const cached = nextAboveWidgetStartIndexCache.get(visualLines)
   if (cached) return cached
-  const index = buildAboveHeightIndex(visualLines)
-  aboveHeightIndexCache.set(visualLines, index)
+  const index = buildNextAboveWidgetStartIndex(visualLines)
+  nextAboveWidgetStartIndexCache.set(visualLines, index)
   return index
 }
 
+function getFallbackLogicalAboveHeight(visualLines: VisualLine[], logicalLine: number): number {
+  let cache = fallbackLogicalAboveHeightCache.get(visualLines)
+  if (!cache) {
+    cache = new Map<number, number>()
+    fallbackLogicalAboveHeightCache.set(visualLines, cache)
+  }
+
+  const cached = cache.get(logicalLine)
+  if (cached !== undefined) return cached
+
+  let consecutiveEmptyHeight = 0
+  for (let i = 0; i < visualLines.length; i++) {
+    const line = visualLines[i]
+    if (line.tokenOffset === 0 && line.logicalLine === logicalLine) {
+      cache.set(logicalLine, consecutiveEmptyHeight)
+      return consecutiveEmptyHeight
+    }
+    if (isLineEmpty(line)) {
+      consecutiveEmptyHeight += line.height
+    }
+    else {
+      consecutiveEmptyHeight = 0
+    }
+  }
+
+  cache.set(logicalLine, 0)
+  return 0
+}
+
 export function getAboveHeight(visualLines: VisualLine[], line: VisualLine): number {
+  if (line.aboveHeight !== undefined) return line.aboveHeight
   if (line.widgets.above.length === 0) return 0
-  const index = getAboveHeightIndex(visualLines)
-  return index.aboveHeightByLine.get(line) ?? 0
-}
-
-function getLogicalAboveHeight(visualLines: VisualLine[], logicalLine: number): number {
-  const index = getAboveHeightIndex(visualLines)
-  return index.logicalAboveHeightByLine.get(logicalLine) ?? 0
-}
-
-function getVisualLineIndex(visualLines: VisualLine[], line: VisualLine): number {
-  const index = getAboveHeightIndex(visualLines)
-  return index.visualLineIndexByLine.get(line) ?? -1
-}
-
-function getNextAboveWidgetStartIndex(visualLines: VisualLine[], lineIndex: number): number {
-  const index = getAboveHeightIndex(visualLines)
-  if (lineIndex < 0 || lineIndex >= index.nextAboveWidgetStartIndexByLineIndex.length) return -1
-  return index.nextAboveWidgetStartIndexByLineIndex[lineIndex] ?? -1
+  return getFallbackLogicalAboveHeight(visualLines, line.logicalLine)
 }
 
 export function calculateAboveHeightForLine(
   context: Context,
   line: VisualLine,
 ): number {
-  return getAboveHeight(context.lines.visualLines.value, line)
+  void context
+  return line.aboveHeight ?? 0
 }
 
 /** True when we should stop iterating (line block is below visible bottom). Empty lines above a line with widgets are part of that line's block. */
@@ -106,15 +96,18 @@ export function shouldBreakBottom(
   lineY: number,
   visibleBottom: number,
   scrollY: number,
+  lineIndex = -1,
 ): boolean {
   const aboveHeight = getAboveHeight(visualLines, line)
   if (lineY <= visibleBottom + aboveHeight) return false
   if (!isLineEmpty(line)) return true
+  if (!hasAnyAboveWidgetStart(visualLines)) return true
 
-  const idx = getVisualLineIndex(visualLines, line)
+  const idx = lineIndex >= 0 ? lineIndex : visualLines.indexOf(line)
   if (idx < 0) return true
 
-  const nextIndex = getNextAboveWidgetStartIndex(visualLines, idx)
+  const nextAboveWidgetStartIndexByLineIndex = getNextAboveWidgetStartIndexArray(visualLines)
+  const nextIndex = nextAboveWidgetStartIndexByLineIndex[idx] ?? -1
   if (nextIndex < 0) return true
 
   const next = visualLines[nextIndex]
@@ -132,9 +125,7 @@ export function drawAboveWidgets(
 
   const { lines } = context
   const { c, size } = context.canvas
-  const visualLines = context.lines.visualLines.value
-
-  const emptyHeight = getAboveHeight(visualLines, line)
+  const emptyHeight = line.aboveHeight ?? line.logicalAboveHeight ?? 0
   if (emptyHeight === 0) return
 
   const tokenLines = context.doc.tokenLines
@@ -199,9 +190,8 @@ export function drawFullWidgets(
   if (fullWidgets.length === 0 || line.tokenOffset !== 0) return
 
   const { c } = context.canvas
-  const visualLines = context.lines.visualLines.value
 
-  const emptyHeight = getLogicalAboveHeight(visualLines, line.logicalLine)
+  const emptyHeight = line.logicalAboveHeight ?? line.aboveHeight ?? 0
   if (emptyHeight === 0) return
 
   const headerHeight = context.header.value?.height ?? 0

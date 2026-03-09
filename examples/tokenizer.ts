@@ -149,6 +149,29 @@ const punctuation = new Set([
   ':',
 ])
 
+type DecodedLineState = {
+  inBlockComment: boolean
+  inTemplateString: boolean
+}
+
+const STATE_IN_BLOCK_COMMENT = 1 << 0
+const STATE_IN_TEMPLATE_STRING = 1 << 1
+
+function decodeState(prevState: unknown): DecodedLineState {
+  const stateBits = typeof prevState === 'number' ? prevState : 0
+  return {
+    inBlockComment: (stateBits & STATE_IN_BLOCK_COMMENT) !== 0,
+    inTemplateString: (stateBits & STATE_IN_TEMPLATE_STRING) !== 0,
+  }
+}
+
+function encodeState(state: DecodedLineState): number {
+  let bits = 0
+  if (state.inBlockComment) bits |= STATE_IN_BLOCK_COMMENT
+  if (state.inTemplateString) bits |= STATE_IN_TEMPLATE_STRING
+  return bits
+}
+
 function isWhitespace(char: string): boolean {
   return /\s/.test(char)
 }
@@ -165,10 +188,68 @@ function isIdentifierChar(char: string): boolean {
   return isLetter(char) || isDigit(char) || char === '_' || char === '$'
 }
 
-export const tokenize: Tokenizer = (input: string) => {
-  const lines: Token[][] = []
-  let currentLine: Token[] = []
+function tokenizeLineInternal(
+  input: string,
+  prevState: unknown,
+): { tokens: Token[]; state: number } {
+  const tokens: Token[] = []
+  const state = decodeState(prevState)
   let i = 0
+
+  if (state.inBlockComment) {
+    let comment = ''
+    while (i < input.length) {
+      const char = input[i]
+      if (char === '*' && input[i + 1] === '/') {
+        comment += '*/'
+        i += 2
+        state.inBlockComment = false
+        break
+      }
+      comment += char
+      i++
+    }
+    if (comment.length > 0) {
+      tokens.push({ text: comment, type: 'comment' })
+    }
+    if (state.inBlockComment) {
+      return { tokens, state: encodeState(state) }
+    }
+  }
+
+  if (state.inTemplateString) {
+    let string = ''
+    let escaped = false
+    while (i < input.length) {
+      const char = input[i]
+      if (escaped) {
+        string += char
+        escaped = false
+        i++
+        continue
+      }
+      if (char === '\\') {
+        string += char
+        escaped = true
+        i++
+        continue
+      }
+      if (char === '`') {
+        string += char
+        i++
+        state.inTemplateString = false
+        break
+      }
+      string += char
+      i++
+    }
+    if (string.length > 0) {
+      tokens.push({ text: string, type: 'string' })
+    }
+    if (state.inTemplateString) {
+      return { tokens, state: encodeState(state) }
+    }
+  }
 
   while (i < input.length) {
     const char = input[i]
@@ -179,78 +260,36 @@ export const tokenize: Tokenizer = (input: string) => {
         whitespace += input[i]
         i++
       }
-      const parts = whitespace.split('\n')
-      if (parts.length > 1) {
-        if (parts[0]) {
-          currentLine.push({
-            text: parts[0],
-            type: 'text',
-          })
-        }
-        for (let j = 1; j < parts.length; j++) {
-          lines.push(currentLine)
-          currentLine = []
-          if (parts[j]) {
-            currentLine.push({
-              text: parts[j],
-              type: 'text',
-            })
-          }
-        }
-      }
-      else {
-        currentLine.push({
-          text: whitespace,
-          type: 'text',
-        })
+      if (whitespace.length > 0) {
+        tokens.push({ text: whitespace, type: 'text' })
       }
       continue
     }
 
     if (char === '/' && input[i + 1] === '/') {
-      let comment = '//'
-      i += 2
-      while (i < input.length && input[i] !== '\n') {
-        comment += input[i]
-        i++
-      }
-      currentLine.push({
-        text: comment,
-        type: 'comment',
-      })
-      continue
+      const comment = input.slice(i)
+      tokens.push({ text: comment, type: 'comment' })
+      break
     }
 
     if (char === '/' && input[i + 1] === '*') {
       let comment = '/*'
       i += 2
-      while (i < input.length - 1) {
-        if (input[i] === '\n') {
-          comment += input[i]
-          currentLine.push({
-            text: comment,
-            type: 'comment',
-          })
-          lines.push(currentLine)
-          currentLine = []
-          comment = ''
-          i++
+      while (i < input.length) {
+        if (input[i] === '*' && input[i + 1] === '/') {
+          comment += '*/'
+          i += 2
+          break
         }
-        else {
-          comment += input[i]
-          if (input[i] === '*' && input[i + 1] === '/') {
-            comment += input[i + 1]
-            i += 2
-            break
-          }
-          i++
-        }
+        comment += input[i]
+        i++
       }
-      if (comment) {
-        currentLine.push({
-          text: comment,
-          type: 'comment',
-        })
+      if (!comment.endsWith('*/')) {
+        state.inBlockComment = true
+      }
+      tokens.push({ text: comment, type: 'comment' })
+      if (state.inBlockComment) {
+        break
       }
       continue
     }
@@ -265,72 +304,57 @@ export const tokenize: Tokenizer = (input: string) => {
           string += input[i]
           escaped = false
           i++
+          continue
         }
-        else if (input[i] === '\\') {
+        if (input[i] === '\\') {
           string += input[i]
           escaped = true
           i++
+          continue
         }
-        else if (input[i] === quote) {
+        if (input[i] === quote) {
           string += input[i]
           i++
           break
         }
-        else {
-          string += input[i]
-          i++
-        }
+        string += input[i]
+        i++
       }
-      currentLine.push({
-        text: string,
-        type: 'string',
-      })
+      tokens.push({ text: string, type: 'string' })
       continue
     }
 
     if (char === '`') {
-      const quote = char
-      let string = quote
+      let string = '`'
       i++
       let escaped = false
+      let closed = false
       while (i < input.length) {
         if (escaped) {
           string += input[i]
           escaped = false
           i++
+          continue
         }
-        else if (input[i] === '\\') {
+        if (input[i] === '\\') {
           string += input[i]
           escaped = true
           i++
+          continue
         }
-        else if (input[i] === '\n') {
-          string += input[i]
-          currentLine.push({
-            text: string,
-            type: 'string',
-          })
-          lines.push(currentLine)
-          currentLine = []
-          string = ''
-          i++
-        }
-        else if (input[i] === quote) {
+        if (input[i] === '`') {
           string += input[i]
           i++
+          closed = true
           break
         }
-        else {
-          string += input[i]
-          i++
-        }
+        string += input[i]
+        i++
       }
-      if (string) {
-        currentLine.push({
-          text: string,
-          type: 'string',
-        })
+      if (!closed) {
+        state.inTemplateString = true
       }
+      tokens.push({ text: string, type: 'string' })
       continue
     }
 
@@ -364,10 +388,7 @@ export const tokenize: Tokenizer = (input: string) => {
           i++
         }
       }
-      currentLine.push({
-        text: number,
-        type: 'number',
-      })
+      tokens.push({ text: number, type: 'number' })
       continue
     }
 
@@ -375,10 +396,7 @@ export const tokenize: Tokenizer = (input: string) => {
     for (let len = 4; len >= 1; len--) {
       const candidate = input.slice(i, i + len)
       if (operators.has(candidate)) {
-        currentLine.push({
-          text: candidate,
-          type: 'operator',
-        })
+        tokens.push({ text: candidate, type: 'operator' })
         i += len
         matched = true
         break
@@ -387,10 +405,7 @@ export const tokenize: Tokenizer = (input: string) => {
     if (matched) continue
 
     if (punctuation.has(char)) {
-      currentLine.push({
-        text: char,
-        type: 'punctuation',
-      })
+      tokens.push({ text: char, type: 'punctuation' })
       i++
       continue
     }
@@ -414,21 +429,34 @@ export const tokenize: Tokenizer = (input: string) => {
       else if (i < input.length && input[i] === '(') {
         type = 'function'
       }
-      currentLine.push({
-        text: identifier,
-        type,
-      })
+      tokens.push({ text: identifier, type })
       continue
     }
 
-    currentLine.push({
-      text: char,
-      type: 'text',
-    })
+    tokens.push({ text: char, type: 'text' })
     i++
   }
 
-  lines.push(currentLine)
+  return { tokens, state: encodeState(state) }
+}
 
-  return lines
+export const tokenizer: Tokenizer = {
+  tokenizeLine(line: string, _lineIndex: number, prevState: unknown) {
+    return tokenizeLineInternal(line, prevState)
+  },
+}
+
+// Compatibility helper used by preview/demo utilities that still tokenize full code at once.
+export function tokenize(input: string): Token[][] {
+  const lines = input.split('\n')
+  const result: Token[][] = new Array(lines.length)
+  let state = 0
+
+  for (let i = 0; i < lines.length; i++) {
+    const lineResult = tokenizeLineInternal(lines[i] ?? '', state)
+    result[i] = lineResult.tokens
+    state = lineResult.state
+  }
+
+  return result
 }

@@ -9,9 +9,47 @@ import { drawSelection } from './draw/selection.ts'
 import { drawTooltip } from './draw/tooltip.ts'
 import { createOverlayCanvas } from './overlay-canvas.ts'
 
+type PerfStats = {
+  emaDrawMs: number
+  emaInputToPaintMs: number
+  lastSampledInputTime: number
+}
+
+const perfStatsByContext = new WeakMap<Context, PerfStats>()
+
+function updatePerformanceMode(context: Context, drawMs: number) {
+  let stats = perfStatsByContext.get(context)
+  if (!stats) {
+    stats = { emaDrawMs: drawMs, emaInputToPaintMs: 0, lastSampledInputTime: 0 }
+    perfStatsByContext.set(context, stats)
+  }
+
+  const ALPHA = 0.15
+  const now = Date.now()
+  const inputTime = context.caret.lastInputTime.value
+  let inputLagSample = 0
+  // Only sample once per new input event; otherwise lag grows forever after typing stops.
+  if (inputTime > 0 && inputTime !== stats.lastSampledInputTime) {
+    stats.lastSampledInputTime = inputTime
+    inputLagSample = Math.max(0, now - inputTime)
+  }
+  stats.emaDrawMs = stats.emaDrawMs * (1 - ALPHA) + drawMs * ALPHA
+  stats.emaInputToPaintMs = stats.emaInputToPaintMs * (1 - ALPHA) + inputLagSample * ALPHA
+
+  const lineCount = context.doc.lines.length
+  let mode: 'normal' | 'large' | 'stress' = 'normal'
+  if (lineCount >= 50_000 || stats.emaDrawMs > 10) mode = 'large'
+  if (lineCount >= 100_000 || stats.emaDrawMs > 16 || stats.emaInputToPaintMs > 45) mode = 'stress'
+
+  if (context.settings.performanceMode !== mode) {
+    context.settings.performanceMode = mode
+  }
+}
+
 function drawContext(context: Context, overlayCanvas: ReturnType<typeof createOverlayCanvas>,
   activeTooltip: Map<Context, 'hover' | 'caret' | null>)
 {
+  const drawStart = performance.now()
   const { canvas } = context
 
   context.mouse.update()
@@ -136,6 +174,8 @@ function drawContext(context: Context, overlayCanvas: ReturnType<typeof createOv
   else if (currentlyActive === 'caret') {
     activeTooltip.set(context, null)
   }
+
+  updatePerformanceMode(context, performance.now() - drawStart)
 }
 
 class RenderManager {

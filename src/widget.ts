@@ -235,8 +235,8 @@ export function adjustWidgetsOnLineDeleteRange(doc: Doc, startLine: number, endL
 
   doc.errors = doc.errors.flatMap(error => {
     const y = error.y
-    if (y > startLine + 1 && y <= endLine + 1) return []
-    if (y > endLine + 1) {
+    if (y > startLine && y <= endLine) return []
+    if (y > endLine) {
       const next = adjustError(error, (x, y) => ({ x, y: y - deletedCount }))
       return [next]
     }
@@ -305,18 +305,18 @@ export function adjustWidgetsOnMultiLineDelete(
 
     doc.errors = doc.errors.map(error =>
       adjustError(error, (x, y) => {
-        if (y === endLine + 1) {
+        if (y === endLine) {
           const [errorStartCol, errorEndCol] = [x[0] - 1, x[1] - 1]
           if (errorStartCol >= endColumn) {
             return { x: [errorStartCol - endColumn + startColumn + 1, errorEndCol - endColumn + startColumn + 1],
-              y: startLine + 1 }
+              y: startLine }
           }
           if (errorEndCol > endColumn) {
-            return { x: [startColumn + 1, errorEndCol - endColumn + startColumn + 1], y: startLine + 1 }
+            return { x: [startColumn, errorEndCol - endColumn + startColumn + 1], y: startLine }
           }
           return null
         }
-        if (y > endLine + 1) return { x, y: y - deletedCount }
+        if (y > endLine) return { x, y: y - deletedCount }
         return null
       })
     )

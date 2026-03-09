@@ -104,7 +104,7 @@ describe('caret screen position', () => {
       },
       lines: {
         visualLines: { value: [visualLine] },
-        visualLinesByLogicalLine: { value: new Map([[0, [visualLine]]]) },
+        visualLinesByLogicalLine: { value: [[visualLine]] },
       },
       caret: caretState,
       settings: {

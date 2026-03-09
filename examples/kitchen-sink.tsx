@@ -10,7 +10,7 @@ import { createDoc, createEditor, type Doc, draw, type Editor, type Token, type 
   type WidgetType, Position } from '../src/editor.ts'
 import { measureText } from '../src/measure.ts'
 import type { OverlayCanvas } from '../src/overlay-canvas.ts'
-import { tokenize } from './tokenizer.ts'
+import { tokenize, tokenizer } from './tokenizer.ts'
 
 // import namesDark from '../public/themes/_names-dark.json'
 // import { setDebugOptions } from '@preact/signals-debug'
@@ -40,7 +40,7 @@ function persist<T extends Record<string, unknown>>(
 }
 
 function createDocument(key: string, code: string) {
-  const doc = createDoc(tokenize)
+  const doc = createDoc(tokenizer)
   doc.code = code
 
   doc.widgets = [

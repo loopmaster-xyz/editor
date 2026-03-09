@@ -1,16 +1,53 @@
-import { computed, effect, type Signal, signal } from '@preact/signals-core'
+import { computed, type Signal, signal } from '@preact/signals-core'
 import type { Blocks } from './blocks.ts'
 import { type Caches, getWrapTokensCacheKey } from './caches.ts'
 import type { Canvas } from './canvas.ts'
-import type { Doc, DocError } from './doc.ts'
+import type { Doc, DocError, DocIncrementalChange } from './doc.ts'
 import { VERTICAL_SCROLLBAR_SIZE } from './draw/scrollbar.ts'
 import type { Header } from './header.ts'
+import { FenwickTree } from './lib/fenwick.ts'
 import { getCharOffsetForVisualLine, isLineEmpty } from './line-utils.ts'
 import { measureText } from './measure.ts'
 import type { Metrics } from './metrics.ts'
 import type { Settings } from './settings.ts'
 import type { Token } from './token.ts'
 import type { Widget } from './widget.ts'
+
+const EMPTY_DOC_ERRORS: DocError[] = []
+const EMPTY_WIDGETS: Widget[] = []
+const EMPTY_TOKENS: Token[] = []
+const EMPTY_VISUAL_LINES: VisualLine[] = []
+
+interface WidgetsByLogicalLineIndex {
+  map: Map<number, Widget[]>
+  hasAboveOrFull: boolean
+}
+
+function buildWidgetsByLogicalLineIndex(widgets: Widget[]): WidgetsByLogicalLineIndex {
+  const map = new Map<number, Widget[]>()
+  let hasAboveOrFull = false
+  for (let i = 0; i < widgets.length; i++) {
+    const widget = widgets[i]
+    const line = widget.pos.y - 1
+    const existing = map.get(line)
+    if (existing) existing.push(widget)
+    else map.set(line, [widget])
+    if (widget.type === 'above' || widget.type === 'full') hasAboveOrFull = true
+  }
+  return { map, hasAboveOrFull }
+}
+
+function buildErrorsByLogicalLineIndex(errors: DocError[]): Map<number, DocError[]> {
+  const map = new Map<number, DocError[]>()
+  for (let i = 0; i < errors.length; i++) {
+    const error = errors[i]
+    const line = error.y - 1
+    const existing = map.get(line)
+    if (existing) existing.push(error)
+    else map.set(line, [error])
+  }
+  return map
+}
 
 function createTokenColumnPrefix(tokens: Token[]): number[] {
   const prefix = new Array(tokens.length + 1)
@@ -67,7 +104,8 @@ function applyAboveWidgetSpace(
 
   for (let i = 0; i < visualLines.length; i++) {
     const line = visualLines[i]
-    const aboveHeight = aboveSpaceByLogicalLine.get(line.logicalLine) || 0
+    const logicalAboveHeight = aboveSpaceByLogicalLine.get(line.logicalLine) || 0
+    const aboveHeight = line.widgets.above.length > 0 ? logicalAboveHeight : 0
     let newHeight = line.height
 
     if (aboveHeight > 0 && line.tokenOffset > 0 && line.widgets.above.length > 0) {
@@ -92,6 +130,8 @@ function applyAboveWidgetSpace(
       ...line,
       y: currentY,
       height: newHeight,
+      aboveHeight,
+      logicalAboveHeight,
     })
 
     currentY += newHeight
@@ -113,6 +153,7 @@ function createVisualLineFromCurrent(
   inlineWidgetWidthIndex: InlineWidgetWidthIndex,
   logicalColumnPrefix: number[],
   logicalTokenIndices?: number[],
+  logicalTokenCharOffsets?: number[],
   currentLineTokenWidths?: number[],
 ): VisualLine {
   const lineStartColumn = logicalColumnPrefix[tokenOffset] ?? 0
@@ -122,7 +163,7 @@ function createVisualLineFromCurrent(
   }
 
   const visualTokens = calculateVisualTokens(c, settings, caches, currentLine, tokenOffset, inlineWidgetWidthIndex,
-    logicalColumnPrefix, logicalTokenIndices, currentLineTokenWidths)
+    logicalColumnPrefix, logicalTokenIndices, logicalTokenCharOffsets, currentLineTokenWidths)
   const calculatedWidth = visualTokens.length > 0 ? visualTokens[visualTokens.length - 1]?.endX || 0 : 0
 
   const aboveWidgets: (Widget & { type: 'above' })[] = []
@@ -174,13 +215,17 @@ function createVisualLineFromCurrent(
 
   const lineHeight = settings.lineHeight * (belowWidgets.length > 0 ? 2 : 1)
 
-  const filteredErrors: DocError[] = []
-  for (let i = 0; i < lineErrors.length; i++) {
-    const error = lineErrors[i]
-    const [errorStartColumn, errorEndColumn] = [error.x[0] - 1, error.x[1] - 1]
-    if (errorStartColumn <= lineEndColumn && errorEndColumn > lineStartColumn) {
-      filteredErrors.push(error)
+  let filteredErrors = EMPTY_DOC_ERRORS
+  if (lineErrors.length > 0) {
+    const out: DocError[] = []
+    for (let i = 0; i < lineErrors.length; i++) {
+      const error = lineErrors[i]
+      const [errorStartColumn, errorEndColumn] = [error.x[0] - 1, error.x[1] - 1]
+      if (errorStartColumn <= lineEndColumn && errorEndColumn > lineStartColumn) {
+        out.push(error)
+      }
     }
+    if (out.length > 0) filteredErrors = out
   }
 
   return {
@@ -190,6 +235,8 @@ function createVisualLineFromCurrent(
     y,
     width: calculatedWidth,
     height: lineHeight,
+    aboveHeight: 0,
+    logicalAboveHeight: 0,
     widgets: {
       above: aboveWidgets,
       below: belowWidgets,
@@ -208,6 +255,19 @@ function filterErrorsFromLine(
   lineLength: number,
   logicalLineTokens: Token[],
 ): DocError[] {
+  if (lineErrors.length === 0) return EMPTY_DOC_ERRORS
+
+  // Common fast path for empty visual lines.
+  if (tokenOffset === 0 && lineLength === 0) {
+    const out: DocError[] = []
+    for (let i = 0; i < lineErrors.length; i++) {
+      const error = lineErrors[i]
+      const [errorStartColumn, errorEndColumn] = [error.x[0] - 1, error.x[1] - 1]
+      if (errorStartColumn <= 0 && errorEndColumn > 0) out.push(error)
+    }
+    return out.length > 0 ? out : EMPTY_DOC_ERRORS
+  }
+
   const logicalColumnPrefix = createTokenColumnPrefix(logicalLineTokens)
   const lineStartColumn = logicalColumnPrefix[tokenOffset] ?? 0
   const lineEndColumn = logicalColumnPrefix[tokenOffset + lineLength] ?? lineStartColumn
@@ -217,7 +277,7 @@ function filterErrorsFromLine(
     const [errorStartColumn, errorEndColumn] = [error.x[0] - 1, error.x[1] - 1]
     if (errorStartColumn <= lineEndColumn && errorEndColumn > lineStartColumn) out.push(error)
   }
-  return out
+  return out.length > 0 ? out : EMPTY_DOC_ERRORS
 }
 
 function calculateVisualTokens(
@@ -229,6 +289,7 @@ function calculateVisualTokens(
   inlineWidgetWidthIndex: InlineWidgetWidthIndex,
   logicalColumnPrefix: number[],
   logicalTokenIndices?: number[],
+  logicalTokenCharOffsets?: number[],
   tokenWidths?: number[],
 ): VisualToken[] {
   const visualTokens: VisualToken[] = []
@@ -256,6 +317,7 @@ function calculateVisualTokens(
       tokenEndX,
       endX: x,
       logicalTokenIndex,
+      logicalCharOffset: logicalTokenCharOffsets ? (logicalTokenCharOffsets[i] ?? 0) : 0,
     })
   }
 
@@ -382,6 +444,7 @@ export interface VisualToken {
   tokenEndX: number
   endX: number
   logicalTokenIndex: number
+  logicalCharOffset: number
 }
 
 export interface VisualLine {
@@ -391,6 +454,8 @@ export interface VisualLine {
   y: number
   width: number
   height: number
+  aboveHeight: number
+  logicalAboveHeight: number
   widgets: {
     above: (Widget & { type: 'above' })[]
     below: (Widget & { type: 'below' })[]
@@ -402,11 +467,31 @@ export interface VisualLine {
   errors: DocError[]
 }
 
-function applyCachedY(cached: VisualLine[], y: number): VisualLine[] {
+function applyCachedPlacement(cached: VisualLine[], y: number, logicalLine: number): VisualLine[] {
+  if (cached.length === 0) return cached
   const baseY = cached[0]?.y ?? y
+  const baseLogicalLine = cached[0]?.logicalLine ?? logicalLine
   const yOffset = y - baseY
-  if (yOffset === 0) return cached
-  return cached.map(line => ({ ...line, y: line.y + yOffset }))
+  const logicalOffset = logicalLine - baseLogicalLine
+  if (yOffset === 0 && logicalOffset === 0) return cached
+
+  const shifted = new Array<VisualLine>(cached.length)
+  for (let i = 0; i < cached.length; i++) {
+    const line = cached[i]
+    shifted[i] = {
+      tokens: line.tokens,
+      logicalLine: line.logicalLine + logicalOffset,
+      tokenOffset: line.tokenOffset,
+      y: line.y + yOffset,
+      width: line.width,
+      height: line.height,
+      aboveHeight: line.aboveHeight,
+      logicalAboveHeight: line.logicalAboveHeight,
+      widgets: line.widgets,
+      errors: line.errors,
+    }
+  }
+  return shifted
 }
 
 function wrapTokens(
@@ -414,41 +499,34 @@ function wrapTokens(
   settings: Settings,
   caches: Caches,
   tokenLines: Token[][],
-  tokens: Token[],
+  tokens: Token[] | undefined,
   logicalLine: number,
   y: number,
   maxWidth: number,
   lineWidgets: Widget[],
   lineErrors: DocError[],
 ): VisualLine[] {
-  const { wrapTokensCache, wrapTokensCacheByLine } = caches
-  const cacheKey = getWrapTokensCacheKey(tokens, logicalLine, maxWidth, lineWidgets, lineErrors, settings)
-
-  if (wrapTokensCache) {
-    if (wrapTokensCacheByLine) {
-      const existingKey = wrapTokensCacheByLine.get(logicalLine)
-      if (existingKey === cacheKey) {
-        const cached = wrapTokensCache.get(existingKey)
-        if (cached) return applyCachedY(cached, y)
-      }
-    }
-
-    const cached = wrapTokensCache.get(cacheKey)
-    if (cached) {
-      if (wrapTokensCacheByLine) {
-        wrapTokensCacheByLine.set(logicalLine, cacheKey)
-      }
-      return applyCachedY(cached, y)
-    }
+  const safeTokens = tokens ?? EMPTY_TOKENS
+  const { wrapTokensCacheByTokenRef } = caches
+  const hasDecorations = lineWidgets.length > 0 || lineErrors.length > 0
+  const cacheKey = hasDecorations
+    ? getWrapTokensCacheKey(maxWidth, lineWidgets, lineErrors, settings)
+    : `${maxWidth}|${settings.lineHeight}|${settings.fontSize}`
+  const cachedByVariant = wrapTokensCacheByTokenRef.get(safeTokens)
+  const cached = cachedByVariant?.get(cacheKey)
+  if (cached) {
+    return applyCachedPlacement(cached, y, logicalLine)
   }
 
-  if (tokens.length === 0) {
-    const aboveWidgets = (lineWidgets.filter(w => w.type === 'above') as (Widget & { type: 'above' })[]).filter(widget => {
-      const [startColumn, endColumn] = widget.pos.x
-      const startCol0 = startColumn - 1
-      const endCol0 = endColumn - 1
-      return startCol0 <= 0 && endCol0 > 0
-    })
+  if (safeTokens.length === 0) {
+    const aboveWidgets = (lineWidgets.filter(w => w.type === 'above') as (Widget & { type: 'above' })[]).filter(
+      widget => {
+        const [startColumn, endColumn] = widget.pos.x
+        const startCol0 = startColumn - 1
+        const endCol0 = endColumn - 1
+        return startCol0 <= 0 && endCol0 > 0
+      },
+    )
     const result = [{
       tokens: [],
       logicalLine,
@@ -456,6 +534,8 @@ function wrapTokens(
       y,
       width: 0,
       height: settings.lineHeight,
+      aboveHeight: 0,
+      logicalAboveHeight: 0,
       widgets: {
         above: aboveWidgets,
         below: [],
@@ -464,14 +544,12 @@ function wrapTokens(
         beforeAfter: [],
         full: [],
       },
-      errors: filterErrorsFromLine(lineErrors, 0, 0, tokenLines[logicalLine] ?? []),
+      errors: lineErrors.length === 0
+        ? EMPTY_DOC_ERRORS
+        : filterErrorsFromLine(lineErrors, 0, 0, tokenLines[logicalLine] ?? EMPTY_TOKENS),
     }]
-    if (wrapTokensCache) {
-      wrapTokensCache.set(cacheKey, result)
-      if (wrapTokensCacheByLine) {
-        wrapTokensCacheByLine.set(logicalLine, cacheKey)
-      }
-    }
+    if (cachedByVariant) cachedByVariant.set(cacheKey, result)
+    else wrapTokensCacheByTokenRef.set(safeTokens, new Map([[cacheKey, result]]))
     return result
   }
 
@@ -486,7 +564,8 @@ function wrapTokens(
   let currentY = y
   let currentLineWidth = 0
   const currentLineTokenWidths: number[] = []
-  const logicalLineTokens = tokenLines[logicalLine] ?? []
+  const currentLineTokenCharOffsets: number[] = []
+  const logicalLineTokens = tokenLines[logicalLine] ?? safeTokens
   const logicalColumnPrefix = createTokenColumnPrefix(logicalLineTokens)
 
   function flushCurrentLine() {
@@ -505,6 +584,7 @@ function wrapTokens(
       inlineWidgetWidthIndex,
       logicalColumnPrefix,
       currentLineLogicalIndices,
+      currentLineTokenCharOffsets,
       currentLineTokenWidths,
     )
     visualLines.push(visualLine)
@@ -512,10 +592,16 @@ function wrapTokens(
     currentLine.length = 0
     currentLineLogicalIndices.length = 0
     currentLineTokenWidths.length = 0
+    currentLineTokenCharOffsets.length = 0
     currentLineWidth = 0
   }
 
-  function tryAddTokenToCurrentLine(token: Token, logicalTokenIndex: number, tokenWidth: number) {
+  function tryAddTokenToCurrentLine(
+    token: Token,
+    logicalTokenIndex: number,
+    tokenWidth: number,
+    logicalTokenCharOffset = 0,
+  ) {
     const tokenStartColumn = logicalColumnPrefix[logicalTokenIndex] ?? 0
     const tokenEndColumn = logicalColumnPrefix[logicalTokenIndex + 1] ?? tokenStartColumn
     const beforeWidth = inlineWidgetWidthIndex.before.get(tokenStartColumn) ?? 0
@@ -530,6 +616,7 @@ function wrapTokens(
       currentLine.push(token)
       currentLineLogicalIndices.push(logicalTokenIndex)
       currentLineTokenWidths.push(tokenWidth)
+      currentLineTokenCharOffsets.push(logicalTokenCharOffset)
       return currentLineWidth
     }
 
@@ -537,19 +624,22 @@ function wrapTokens(
     currentLine.push(token)
     currentLineLogicalIndices.push(logicalTokenIndex)
     currentLineTokenWidths.push(tokenWidth)
+    currentLineTokenCharOffsets.push(logicalTokenCharOffset)
     return currentLineWidth
   }
 
-  for (let logicalIndex = 0; logicalIndex < tokens.length; logicalIndex++) {
-    const token = tokens[logicalIndex]
+  for (let logicalIndex = 0; logicalIndex < safeTokens.length; logicalIndex++) {
+    const token = safeTokens[logicalIndex]
     const tokenWidth = measureText(c, settings, caches, token).width
 
     if (tokenWidth > maxWidth) {
       const brokenTokens = breakToken(c, settings, caches, token, maxWidth)
+      let brokenCharOffset = 0
       for (let i = 0; i < brokenTokens.length; i++) {
         const brokenToken = brokenTokens[i]
         const brokenTokenWidth = measureText(c, settings, caches, brokenToken).width
-        tryAddTokenToCurrentLine(brokenToken, logicalIndex, brokenTokenWidth)
+        tryAddTokenToCurrentLine(brokenToken, logicalIndex, brokenTokenWidth, brokenCharOffset)
+        brokenCharOffset += brokenToken.text.length
       }
     }
     else {
@@ -568,6 +658,8 @@ function wrapTokens(
       y,
       width: 0,
       height: settings.lineHeight,
+      aboveHeight: 0,
+      logicalAboveHeight: 0,
       widgets: {
         above: lineWidgets.filter(w => w.type === 'above') as (Widget & { type: 'above' })[],
         below: [],
@@ -576,20 +668,115 @@ function wrapTokens(
         beforeAfter: [],
         full: lineWidgets.filter(w => w.type === 'full') as (Widget & { type: 'full' })[],
       },
-      errors: filterErrorsFromLine(lineErrors, 0, 0, tokenLines[logicalLine] ?? []),
+      errors: lineErrors.length === 0
+        ? EMPTY_DOC_ERRORS
+        : filterErrorsFromLine(lineErrors, 0, 0, tokenLines[logicalLine] ?? EMPTY_TOKENS),
     } as VisualLine]
 
-  if (wrapTokensCache) {
-    wrapTokensCache.set(cacheKey, result)
-    if (wrapTokensCacheByLine) {
-      wrapTokensCacheByLine.set(logicalLine, cacheKey)
-    }
-  }
+  if (cachedByVariant) cachedByVariant.set(cacheKey, result)
+  else wrapTokensCacheByTokenRef.set(safeTokens, new Map([[cacheKey, result]]))
 
   return result
 }
 
 export type Lines = ReturnType<typeof createLines>
+
+interface LogicalLineLayoutCache {
+  tokenRef: Token[]
+  visualLines: VisualLine[]
+  startY: number
+  height: number
+  width: number
+  pendingYShift: number
+  pendingLogicalShift: number
+}
+
+interface VisualLayoutCacheState {
+  maxWidth: number
+  baseAvailableWidth: number
+  lineHeight: number
+  fontSize: string
+  wordWrap: boolean
+  lineLayouts: LogicalLineLayoutCache[]
+  lineHeights: number[]
+  heightIndex: FenwickTree
+}
+
+interface VisualLayoutOutput {
+  visualLines: VisualLine[]
+  visualLinesByLogicalLine: (VisualLine[] | undefined)[]
+  lineLayouts: LogicalLineLayoutCache[]
+  lineHeights: number[]
+  heightIndex: FenwickTree
+  hasAboveOrFullWidgets: boolean
+  totalWidth: number
+  totalHeight: number
+}
+
+interface CaretLayoutSnapshot {
+  lineLayouts: LogicalLineLayoutCache[]
+  heightIndex: FenwickTree
+  totalWidth: number
+  totalHeight: number
+}
+
+function lowerBoundVisualLineBottomAtLeast(visualLines: VisualLine[], minBottomY: number): number {
+  let low = 0
+  let high = visualLines.length
+
+  while (low < high) {
+    const mid = (low + high) >> 1
+    const line = visualLines[mid]
+    if (line.y + line.height < minBottomY) {
+      low = mid + 1
+    }
+    else {
+      high = mid
+    }
+  }
+
+  return low
+}
+
+function getVisualLineBlockMetrics(visual: VisualLine[], startY: number): { height: number; width: number } {
+  if (visual.length === 0) return { height: 0, width: 0 }
+  let width = 0
+  for (let i = 0; i < visual.length; i++) {
+    if (visual[i].width > width) width = visual[i].width
+  }
+  const last = visual[visual.length - 1]
+  return {
+    height: Math.max(0, (last.y + last.height) - startY),
+    width,
+  }
+}
+
+function createSkippedLineLayout(tokenRef: Token[], y: number): LogicalLineLayoutCache {
+  return {
+    tokenRef,
+    visualLines: [],
+    startY: y,
+    height: 0,
+    width: 0,
+    pendingYShift: 0,
+    pendingLogicalShift: 0,
+  }
+}
+
+function getCollapsedSkipUntilBeforeLine(
+  collapsedLines: Set<number>,
+  blockEnds: Map<number, number>,
+  beforeLine: number,
+): number {
+  let skipUntil = -1
+  for (const collapsedStart of collapsedLines) {
+    if (collapsedStart >= beforeLine) continue
+    const collapsedEnd = blockEnds.get(collapsedStart)
+    if (collapsedEnd === undefined) continue
+    if (collapsedEnd > skipUntil) skipUntil = collapsedEnd
+  }
+  return skipUntil
+}
 
 export function createLines(
   doc: Doc,
@@ -600,54 +787,350 @@ export function createLines(
   blocks: Blocks,
   header: Signal<Header>,
 ) {
-  const totalWidth = signal(0)
-  const totalHeight = signal(0)
+  void header
+  const incrementalTokenChange = signal<DocIncrementalChange | null>(null)
+  doc.onIncrementalChange(change => {
+    incrementalTokenChange.value = change
+  })
 
-  const visualLines = computed(() => {
+  let previousLayout: VisualLayoutCacheState | null = null
+  let latestCaretLayoutSnapshot: CaretLayoutSnapshot | null = null
+  let cachedWidgetsRef: Widget[] | null = null
+  let cachedWidgetsIndex: WidgetsByLogicalLineIndex = { map: new Map(), hasAboveOrFull: false }
+  let cachedErrorsRef: DocError[] | null = null
+  let cachedErrorsByLine: Map<number, DocError[]> = new Map()
+
+  const visualData = computed<VisualLayoutOutput>(() => {
     const tokenLines = doc.tokenLines
-    header.value
+    const tokenChange = incrementalTokenChange.value
+    const widgetsRef = doc.widgets
+    const errorsRef = doc.errors
     const baseAvailableWidth = canvas.size.width.value - settings.paddingLeft - settings.paddingRight
       - metrics.gutterWidth.value
     const maxWidth = settings.wordWrap
       ? baseAvailableWidth - VERTICAL_SCROLLBAR_SIZE
       : Infinity
 
-    const widgetsByLogicalLine = new Map<number, Widget[]>()
-    for (const widget of doc.widgets) {
-      const line = widget.pos.y - 1
-      const existing = widgetsByLogicalLine.get(line)
-      if (existing) {
-        existing.push(widget)
+    if (widgetsRef !== cachedWidgetsRef) {
+      cachedWidgetsRef = widgetsRef
+      cachedWidgetsIndex = buildWidgetsByLogicalLineIndex(widgetsRef)
+    }
+    const widgetsByLogicalLine = cachedWidgetsIndex.map
+    const hasAboveOrFullWidgets = cachedWidgetsIndex.hasAboveOrFull
+
+    if (errorsRef !== cachedErrorsRef) {
+      cachedErrorsRef = errorsRef
+      cachedErrorsByLine = buildErrorsByLogicalLineIndex(errorsRef)
+    }
+    const errorsByLogicalLine = cachedErrorsByLine
+
+    const hasCollapsed = doc.collapsed.size > 0
+    const collapsedLines = doc.collapsed
+    const collapsedBlockEnds = hasCollapsed ? blocks.blockEnds.value : null
+
+    const canIncrementalLayoutPatch = previousLayout !== null
+      && tokenChange !== null
+      && tokenChange.source !== 'reset'
+      && previousLayout.maxWidth === maxWidth
+      && previousLayout.baseAvailableWidth === baseAvailableWidth
+      && previousLayout.lineHeight === settings.lineHeight
+      && previousLayout.fontSize === settings.fontSize
+      && previousLayout.wordWrap === settings.wordWrap
+
+    if (canIncrementalLayoutPatch) {
+      const prev = previousLayout
+      const delta = tokenChange.endLineAfter - tokenChange.endLineBefore
+      const newLayouts: LogicalLineLayoutCache[] = new Array(tokenLines.length)
+      const nextLineHeights = prev.lineHeights.slice()
+      let maxLineWidth = 0
+
+      if (delta > 0) {
+        const insertAt = Math.max(0, Math.min(tokenChange.endLineBefore + 1, nextLineHeights.length))
+        nextLineHeights.splice(insertAt, 0, ...new Array<number>(delta).fill(0))
       }
-      else {
-        widgetsByLogicalLine.set(line, [widget])
+      else if (delta < 0) {
+        const removeAt = Math.max(0, Math.min(tokenChange.endLineAfter + 1, nextLineHeights.length))
+        const removeCount = Math.min(-delta, Math.max(0, nextLineHeights.length - removeAt))
+        if (removeCount > 0) nextLineHeights.splice(removeAt, removeCount)
+      }
+      if (nextLineHeights.length > tokenLines.length) nextLineHeights.length = tokenLines.length
+      while (nextLineHeights.length < tokenLines.length) nextLineHeights.push(0)
+
+      const nextHeightIndex = FenwickTree.from(nextLineHeights)
+      const getLineStartY = (lineIndex: number) => (lineIndex <= 0 ? 0 : nextHeightIndex.sum(lineIndex - 1))
+      const includeLayoutWidth = (layout: LogicalLineLayoutCache) => {
+        if (layout.width > maxLineWidth) maxLineWidth = layout.width
+      }
+      const setLayoutWithHeightUpdate = (lineIndex: number, layout: LogicalLineLayoutCache) => {
+        newLayouts[lineIndex] = layout
+        includeLayoutWidth(layout)
+        const previousHeight = nextLineHeights[lineIndex] ?? 0
+        if (layout.height !== previousHeight) {
+          nextLineHeights[lineIndex] = layout.height
+          nextHeightIndex.add(lineIndex, layout.height - previousHeight)
+        }
+      }
+
+      let recomputeStart = Math.max(0, Math.min(tokenChange.startLine, tokenLines.length))
+      while (recomputeStart > 0) {
+        const prevIndex = recomputeStart - 1
+        const prevLayout = prev.lineLayouts[prevIndex]
+        const prevTokenRef = tokenLines[prevIndex] ?? EMPTY_TOKENS
+        if (prevLayout && prevTokenRef !== EMPTY_TOKENS && prevTokenRef === prevLayout.tokenRef) break
+        recomputeStart--
+      }
+
+      for (let i = 0; i < recomputeStart; i++) {
+        const prevLayout = prev.lineLayouts[i]
+        const tokenRef = tokenLines[i] ?? EMPTY_TOKENS
+        if (!prevLayout || tokenRef === EMPTY_TOKENS || tokenRef !== prevLayout.tokenRef) {
+          recomputeStart = i
+          break
+        }
+        newLayouts[i] = prevLayout
+        includeLayoutWidth(prevLayout)
+      }
+
+      let scanSkipUntil = hasCollapsed && collapsedBlockEnds
+        ? getCollapsedSkipUntilBeforeLine(collapsedLines, collapsedBlockEnds, recomputeStart)
+        : -1
+
+      const processedEnd = Math.max(
+        recomputeStart - 1,
+        Math.min(tokenLines.length - 1, tokenChange.tokenProcessedEndLine),
+      )
+
+      let scannedLine = recomputeStart
+      for (; scannedLine <= processedEnd; scannedLine++) {
+        const lineIndex = scannedLine
+        const tokenRef = tokenLines[lineIndex] ?? EMPTY_TOKENS
+
+        const y = getLineStartY(lineIndex)
+        if (lineIndex <= scanSkipUntil) {
+          setLayoutWithHeightUpdate(lineIndex, createSkippedLineLayout(tokenRef, y))
+          continue
+        }
+
+        const lineWidgets = widgetsByLogicalLine.get(lineIndex) ?? EMPTY_WIDGETS
+        const lineErrors = errorsByLogicalLine.get(lineIndex) ?? EMPTY_DOC_ERRORS
+        const wrapped = wrapTokens(
+          canvas.c,
+          settings,
+          caches,
+          tokenLines,
+          tokenRef,
+          lineIndex,
+          y,
+          maxWidth,
+          lineWidgets,
+          lineErrors,
+        )
+        const metricsForLine = getVisualLineBlockMetrics(wrapped, y)
+        setLayoutWithHeightUpdate(lineIndex, {
+          tokenRef,
+          visualLines: wrapped,
+          startY: y,
+          height: metricsForLine.height,
+          width: metricsForLine.width,
+          pendingYShift: 0,
+          pendingLogicalShift: 0,
+        })
+
+        if (hasCollapsed && collapsedBlockEnds && collapsedLines.has(lineIndex)) {
+          scanSkipUntil = collapsedBlockEnds.get(lineIndex) ?? scanSkipUntil
+        }
+      }
+
+      let firstUnfilled = Math.max(recomputeStart, processedEnd + 1)
+
+      if (firstUnfilled < tokenLines.length) {
+        const boundaryNew = firstUnfilled
+        const boundaryOld = boundaryNew - delta
+
+        if (boundaryOld >= 0 && boundaryOld < prev.lineLayouts.length) {
+          const oldBoundary = prev.lineLayouts[boundaryOld]
+          if (oldBoundary) {
+            const yDelta = getLineStartY(boundaryNew) - oldBoundary.startY
+            const logicalDelta = boundaryNew - boundaryOld
+            const maxMapCount = Math.min(tokenLines.length - boundaryNew, prev.lineLayouts.length - boundaryOld)
+            let mappedCount = 0
+            for (let offset = 0; offset < maxMapCount; offset++) {
+              const oldLayout = prev.lineLayouts[boundaryOld + offset]
+              if (!oldLayout) break
+              const mappedLineIndex = boundaryNew + offset
+              const mappedTokenRef = tokenLines[mappedLineIndex] ?? EMPTY_TOKENS
+              if (mappedTokenRef === EMPTY_TOKENS || mappedTokenRef !== oldLayout.tokenRef) break
+              oldLayout.startY += yDelta
+              oldLayout.pendingYShift += yDelta
+              oldLayout.pendingLogicalShift += logicalDelta
+              newLayouts[mappedLineIndex] = oldLayout
+              includeLayoutWidth(oldLayout)
+              mappedCount++
+            }
+            firstUnfilled = boundaryNew + mappedCount
+          }
+        }
+      }
+
+      let fillSkipUntil = hasCollapsed && collapsedBlockEnds
+        ? getCollapsedSkipUntilBeforeLine(collapsedLines, collapsedBlockEnds, firstUnfilled)
+        : -1
+      for (let lineIndex = firstUnfilled; lineIndex < tokenLines.length; lineIndex++) {
+        const tokenRef = tokenLines[lineIndex] ?? EMPTY_TOKENS
+        const y = getLineStartY(lineIndex)
+        if (lineIndex <= fillSkipUntil) {
+          setLayoutWithHeightUpdate(lineIndex, createSkippedLineLayout(tokenRef, y))
+          continue
+        }
+
+        const lineWidgets = widgetsByLogicalLine.get(lineIndex) ?? EMPTY_WIDGETS
+        const lineErrors = errorsByLogicalLine.get(lineIndex) ?? EMPTY_DOC_ERRORS
+        const wrapped = wrapTokens(
+          canvas.c,
+          settings,
+          caches,
+          tokenLines,
+          tokenRef,
+          lineIndex,
+          y,
+          maxWidth,
+          lineWidgets,
+          lineErrors,
+        )
+        const metricsForLine = getVisualLineBlockMetrics(wrapped, y)
+        setLayoutWithHeightUpdate(lineIndex, {
+          tokenRef,
+          visualLines: wrapped,
+          startY: y,
+          height: metricsForLine.height,
+          width: metricsForLine.width,
+          pendingYShift: 0,
+          pendingLogicalShift: 0,
+        })
+
+        if (hasCollapsed && collapsedBlockEnds && collapsedLines.has(lineIndex)) {
+          fillSkipUntil = collapsedBlockEnds.get(lineIndex) ?? fillSkipUntil
+        }
+      }
+
+      const nextTotalHeight = nextHeightIndex.total()
+      const nextTotalWidth = settings.wordWrap
+        ? Math.min(maxLineWidth, baseAvailableWidth - VERTICAL_SCROLLBAR_SIZE)
+        : maxLineWidth
+
+      let outputVisualLines: VisualLine[] = []
+      let outputVisualLinesByLogicalLine: (VisualLine[] | undefined)[] = []
+      let outputLineLayouts = newLayouts
+      let outputLineHeights = nextLineHeights
+      let outputHeightIndex = nextHeightIndex
+      let outputTotalHeight = nextTotalHeight
+
+      if (hasAboveOrFullWidgets) {
+        const flattenedVisualLines: VisualLine[] = []
+        for (let i = 0; i < newLayouts.length; i++) {
+          const layout = newLayouts[i]
+          if (!layout) continue
+          const yShift = layout.pendingYShift
+          const logicalShift = layout.pendingLogicalShift
+          if (yShift !== 0 || logicalShift !== 0) {
+            const shifted = layout.visualLines
+            for (let j = 0; j < shifted.length; j++) {
+              const visualLine = shifted[j]
+              visualLine.logicalLine += logicalShift
+              visualLine.y += yShift
+            }
+            layout.pendingYShift = 0
+            layout.pendingLogicalShift = 0
+          }
+
+          const lineVisuals = layout.visualLines
+          if (!lineVisuals || lineVisuals.length === 0) continue
+          for (let j = 0; j < lineVisuals.length; j++) {
+            flattenedVisualLines.push(lineVisuals[j])
+          }
+        }
+
+        outputVisualLines = applyAboveWidgetSpace(doc, flattenedVisualLines, widgetsByLogicalLine)
+        outputTotalHeight = outputVisualLines.length > 0
+          ? outputVisualLines[outputVisualLines.length - 1].y + outputVisualLines[outputVisualLines.length - 1].height
+          : 0
+
+        outputVisualLinesByLogicalLine = new Array<VisualLine[] | undefined>(tokenLines.length)
+        for (let i = 0; i < outputVisualLines.length; i++) {
+          const line = outputVisualLines[i]
+          const existing = outputVisualLinesByLogicalLine[line.logicalLine]
+          if (existing) existing.push(line)
+          else outputVisualLinesByLogicalLine[line.logicalLine] = [line]
+        }
+
+        outputLineLayouts = new Array(tokenLines.length)
+        outputLineHeights = new Array(tokenLines.length).fill(0)
+        for (let logicalLine = 0; logicalLine < tokenLines.length; logicalLine++) {
+          const wrapped = outputVisualLinesByLogicalLine[logicalLine] ?? EMPTY_VISUAL_LINES
+          const startY = wrapped[0]?.y ?? (logicalLine > 0
+            ? (
+              (outputLineLayouts[logicalLine - 1]?.startY ?? 0)
+              + (outputLineLayouts[logicalLine - 1]?.height ?? 0)
+            )
+            : 0)
+          const metricsForLine = getVisualLineBlockMetrics(wrapped, startY)
+          outputLineLayouts[logicalLine] = {
+            tokenRef: tokenLines[logicalLine] ?? EMPTY_TOKENS,
+            visualLines: wrapped,
+            startY,
+            height: metricsForLine.height,
+            width: metricsForLine.width,
+            pendingYShift: 0,
+            pendingLogicalShift: 0,
+          }
+          outputLineHeights[logicalLine] = metricsForLine.height
+        }
+        outputHeightIndex = FenwickTree.from(outputLineHeights)
+      }
+
+      latestCaretLayoutSnapshot = {
+        lineLayouts: outputLineLayouts,
+        heightIndex: outputHeightIndex,
+        totalWidth: nextTotalWidth,
+        totalHeight: outputTotalHeight,
+      }
+
+      previousLayout = {
+        maxWidth,
+        baseAvailableWidth,
+        lineHeight: settings.lineHeight,
+        fontSize: settings.fontSize,
+        wordWrap: settings.wordWrap,
+        lineLayouts: outputLineLayouts,
+        lineHeights: outputLineHeights,
+        heightIndex: outputHeightIndex,
+      }
+      return {
+        visualLines: outputVisualLines,
+        visualLinesByLogicalLine: outputVisualLinesByLogicalLine,
+        lineLayouts: outputLineLayouts,
+        lineHeights: outputLineHeights,
+        heightIndex: outputHeightIndex,
+        hasAboveOrFullWidgets,
+        totalWidth: nextTotalWidth,
+        totalHeight: outputTotalHeight,
       }
     }
 
-    const errorsByLogicalLine = new Map<number, DocError[]>()
-    for (const error of doc.errors) {
-      const line = error.y - 1
-      const existing = errorsByLogicalLine.get(line)
-      if (existing) {
-        existing.push(error)
-      }
-      else {
-        errorsByLogicalLine.set(line, [error])
-      }
-    }
-
-    const visualLines: VisualLine[] = []
-    let logicalLine = 0
+    const visualLinesByLogicalLine: (VisualLine[] | undefined)[] = hasAboveOrFullWidgets
+      ? new Array<VisualLine[] | undefined>(tokenLines.length)
+      : []
+    const lineLayouts: LogicalLineLayoutCache[] = new Array(tokenLines.length)
+    const lineHeights: number[] = new Array(tokenLines.length).fill(0)
     let maxLineWidth = 0
     let y = 0
-    const collapsedLines = doc.collapsed
-
     let skipUntil = -1
 
-    for (const tokens of tokenLines) {
+    for (let logicalLine = 0; logicalLine < tokenLines.length; logicalLine++) {
+      const tokens = tokenLines[logicalLine] ?? EMPTY_TOKENS
       if (logicalLine > skipUntil) {
-        const lineWidgets = widgetsByLogicalLine.get(logicalLine) ?? []
-        const lineErrors = errorsByLogicalLine.get(logicalLine) ?? []
+        const lineWidgets = widgetsByLogicalLine.get(logicalLine) ?? EMPTY_WIDGETS
+        const lineErrors = errorsByLogicalLine.get(logicalLine) ?? EMPTY_DOC_ERRORS
 
         const wrapped = wrapTokens(
           canvas.c,
@@ -661,9 +1144,21 @@ export function createLines(
           lineWidgets,
           lineErrors,
         )
-        for (let i = 0; i < wrapped.length; i++) {
-          visualLines.push(wrapped[i])
+        if (hasAboveOrFullWidgets && wrapped.length > 0) {
+          visualLinesByLogicalLine[logicalLine] = wrapped
         }
+
+        const metricsForLine = getVisualLineBlockMetrics(wrapped, y)
+        lineLayouts[logicalLine] = {
+          tokenRef: tokens,
+          visualLines: wrapped,
+          startY: y,
+          height: metricsForLine.height,
+          width: metricsForLine.width,
+          pendingYShift: 0,
+          pendingLogicalShift: 0,
+        }
+        lineHeights[logicalLine] = metricsForLine.height
 
         const last = wrapped[wrapped.length - 1]
         y = (last?.y ?? y) + (last?.height ?? 0)
@@ -671,47 +1166,351 @@ export function createLines(
           if (wrapped[i].width > maxLineWidth) maxLineWidth = wrapped[i].width
         }
 
-        if (collapsedLines.has(logicalLine)) {
-          skipUntil = blocks.blockEnds.value.get(logicalLine) ?? -1
+        if (hasCollapsed && collapsedBlockEnds && collapsedLines.has(logicalLine)) {
+          skipUntil = collapsedBlockEnds.get(logicalLine) ?? -1
+        }
+      }
+      else {
+        lineLayouts[logicalLine] = createSkippedLineLayout(tokens, y)
+        lineHeights[logicalLine] = 0
+      }
+    }
+
+    const nextTotalWidth = settings.wordWrap
+      ? Math.min(maxLineWidth, baseAvailableWidth - VERTICAL_SCROLLBAR_SIZE)
+      : maxLineWidth
+
+    let processedLines: VisualLine[] = []
+    let processedVisualLinesByLogicalLine: (VisualLine[] | undefined)[] = hasAboveOrFullWidgets
+      ? visualLinesByLogicalLine
+      : []
+    let processedLineLayouts = lineLayouts
+    let processedLineHeights = lineHeights
+    let processedHeightIndex = FenwickTree.from(lineHeights)
+    let nextTotalHeight = y
+    if (hasAboveOrFullWidgets) {
+      const flattenedVisualLines: VisualLine[] = []
+      for (let i = 0; i < lineLayouts.length; i++) {
+        const lineVisuals = lineLayouts[i]?.visualLines
+        if (!lineVisuals || lineVisuals.length === 0) continue
+        for (let j = 0; j < lineVisuals.length; j++) {
+          flattenedVisualLines.push(lineVisuals[j])
         }
       }
 
-      logicalLine++
+      processedLines = applyAboveWidgetSpace(doc, flattenedVisualLines, widgetsByLogicalLine)
+      nextTotalHeight = processedLines.length > 0
+        ? processedLines[processedLines.length - 1].y + processedLines[processedLines.length - 1].height
+        : 0
+
+      processedVisualLinesByLogicalLine = new Array<VisualLine[] | undefined>(tokenLines.length)
+      for (let i = 0; i < processedLines.length; i++) {
+        const line = processedLines[i]
+        const existing = processedVisualLinesByLogicalLine[line.logicalLine]
+        if (existing) existing.push(line)
+        else processedVisualLinesByLogicalLine[line.logicalLine] = [line]
+      }
+
+      processedLineLayouts = new Array(tokenLines.length)
+      processedLineHeights = new Array(tokenLines.length).fill(0)
+      for (let logicalLine = 0; logicalLine < tokenLines.length; logicalLine++) {
+        const wrapped = processedVisualLinesByLogicalLine[logicalLine] ?? []
+        const startY = wrapped[0]?.y ?? (logicalLine > 0
+          ? ((processedLineLayouts[logicalLine - 1]?.startY ?? 0) + (processedLineLayouts[logicalLine - 1]?.height ?? 0))
+          : 0)
+        const metricsForLine = getVisualLineBlockMetrics(wrapped, startY)
+        processedLineLayouts[logicalLine] = {
+          tokenRef: tokenLines[logicalLine] ?? EMPTY_TOKENS,
+          visualLines: wrapped,
+          startY,
+          height: metricsForLine.height,
+          width: metricsForLine.width,
+          pendingYShift: 0,
+          pendingLogicalShift: 0,
+        }
+        processedLineHeights[logicalLine] = metricsForLine.height
+      }
+      processedHeightIndex = FenwickTree.from(processedLineHeights)
     }
 
-    if (settings.wordWrap) {
-      totalWidth.value = Math.min(maxLineWidth, baseAvailableWidth - VERTICAL_SCROLLBAR_SIZE)
+    if (!hasAboveOrFullWidgets) {
+      previousLayout = {
+        maxWidth,
+        baseAvailableWidth,
+        lineHeight: settings.lineHeight,
+        fontSize: settings.fontSize,
+        wordWrap: settings.wordWrap,
+        lineLayouts: processedLineLayouts,
+        lineHeights: processedLineHeights,
+        heightIndex: processedHeightIndex,
+      }
     }
     else {
-      totalWidth.value = maxLineWidth
+      previousLayout = null
     }
 
-    const processedLines = applyAboveWidgetSpace(doc, visualLines, widgetsByLogicalLine)
-    totalHeight.value = processedLines.length > 0
-      ? processedLines[processedLines.length - 1].y + processedLines[processedLines.length - 1].height
-      : y
+    latestCaretLayoutSnapshot = {
+      lineLayouts: processedLineLayouts,
+      heightIndex: processedHeightIndex,
+      totalWidth: nextTotalWidth,
+      totalHeight: nextTotalHeight,
+    }
 
-    return processedLines
+    return {
+      visualLines: processedLines,
+      visualLinesByLogicalLine: processedVisualLinesByLogicalLine,
+      lineLayouts: processedLineLayouts,
+      lineHeights: processedLineHeights,
+      heightIndex: processedHeightIndex,
+      hasAboveOrFullWidgets,
+      totalWidth: nextTotalWidth,
+      totalHeight: nextTotalHeight,
+    }
   })
 
+  const materializeLayoutVisualLines = (layout: LogicalLineLayoutCache | undefined): VisualLine[] | undefined => {
+    if (!layout) return undefined
+    const yShift = layout.pendingYShift
+    const logicalShift = layout.pendingLogicalShift
+    if (yShift !== 0 || logicalShift !== 0) {
+      const shifted = layout.visualLines
+      for (let i = 0; i < shifted.length; i++) {
+        const visualLine = shifted[i]
+        visualLine.logicalLine += logicalShift
+        visualLine.y += yShift
+      }
+      layout.pendingYShift = 0
+      layout.pendingLogicalShift = 0
+    }
+    return layout.visualLines
+  }
+
+  const visualLinesByLogicalLineProxy = new Proxy([] as (VisualLine[] | undefined)[], {
+    get(_target, prop) {
+      if (prop === 'length') return visualData.value.lineLayouts.length
+      if (typeof prop === 'string') {
+        const lineIndex = Number(prop)
+        if (Number.isInteger(lineIndex) && lineIndex >= 0) {
+          return materializeLayoutVisualLines(visualData.value.lineLayouts[lineIndex])
+        }
+      }
+      const rawByLogicalLine = visualData.value.visualLinesByLogicalLine as unknown as Record<PropertyKey, unknown>
+      return rawByLogicalLine[prop as keyof typeof rawByLogicalLine]
+    },
+  })
+
+  const visualLines = computed(() => {
+    const data = visualData.value
+    if (data.visualLines.length > 0) return data.visualLines
+
+    const flattened: VisualLine[] = []
+    const lineLayouts = data.lineLayouts
+    for (let i = 0; i < lineLayouts.length; i++) {
+      const lineVisuals = materializeLayoutVisualLines(lineLayouts[i])
+      if (!lineVisuals || lineVisuals.length === 0) continue
+      for (let j = 0; j < lineVisuals.length; j++) {
+        flattened.push(lineVisuals[j])
+      }
+    }
+    return flattened
+  })
   const visualLinesByLogicalLine = computed(() => {
-    const map = new Map<number, VisualLine[]>()
-    for (const line of visualLines.value) {
-      const existing = map.get(line.logicalLine)
-      if (existing) {
-        existing.push(line)
+    void visualData.value
+    return visualLinesByLogicalLineProxy
+  })
+  const totalWidth = computed(() => visualData.value.totalWidth)
+  const totalHeight = computed(() => visualData.value.totalHeight)
+
+  const getVisibleVisualLines = (visibleTop: number, visibleBottom: number, scrollY: number): VisualLine[] => {
+    const data = visualData.value
+    const contentTop = visibleTop - scrollY
+    const contentBottom = visibleBottom - scrollY
+    const margin = settings.lineHeight
+
+    if (data.visualLines.length > 0) {
+      const allLines = data.visualLines
+      if (allLines.length === 0) return []
+      const out: VisualLine[] = []
+      const startIndex = lowerBoundVisualLineBottomAtLeast(allLines, contentTop)
+      for (let i = startIndex; i < allLines.length; i++) {
+        const line = allLines[i]
+        const blockTop = line.y - (line.aboveHeight ?? 0)
+        if (blockTop > contentBottom + margin) break
+        const blockBottom = line.y + line.height
+        if (blockBottom >= contentTop) out.push(line)
       }
-      else {
-        map.set(line.logicalLine, [line])
+      return out
+    }
+
+    const lineLayouts = data.lineLayouts
+    if (lineLayouts.length === 0) return []
+
+    let lineIndex = data.heightIndex.lowerBound(Math.max(0, contentTop))
+    if (lineIndex > 0) lineIndex--
+    if (lineIndex < 0) lineIndex = 0
+
+    const out: VisualLine[] = []
+    for (; lineIndex < lineLayouts.length; lineIndex++) {
+      const layout = lineLayouts[lineIndex]
+      if (!layout) continue
+      if (layout.startY > contentBottom + margin) break
+
+      const lineVisuals = materializeLayoutVisualLines(layout)
+      if (!lineVisuals) continue
+      for (let j = 0; j < lineVisuals.length; j++) {
+        const line = lineVisuals[j]
+        const blockTop = line.y - (line.aboveHeight ?? 0)
+        if (blockTop > contentBottom + margin) return out
+        const blockBottom = line.y + line.height
+        if (blockBottom >= contentTop) out.push(line)
       }
     }
-    return map
-  })
 
-  effect(() => {
-    settings.wordWrap
-    totalWidth.value = 0
-  })
+    return out
+  }
 
-  return { visualLines, visualLinesByLogicalLine, totalWidth, totalHeight }
+  const getLastVisualLine = (): VisualLine | null => {
+    const data = visualData.value
+    if (data.visualLines.length > 0) {
+      return data.visualLines.at(-1) ?? null
+    }
+
+    const lineLayouts = data.lineLayouts
+    for (let i = lineLayouts.length - 1; i >= 0; i--) {
+      const lineVisuals = materializeLayoutVisualLines(lineLayouts[i])
+      if (lineVisuals && lineVisuals.length > 0) {
+        return lineVisuals[lineVisuals.length - 1] ?? null
+      }
+    }
+    return null
+  }
+
+  const getFirstVisualLine = (): VisualLine | null => {
+    const data = visualData.value
+    if (data.visualLines.length > 0) {
+      return data.visualLines[0] ?? null
+    }
+
+    const lineLayouts = data.lineLayouts
+    for (let i = 0; i < lineLayouts.length; i++) {
+      const lineVisuals = materializeLayoutVisualLines(lineLayouts[i])
+      if (lineVisuals && lineVisuals.length > 0) return lineVisuals[0] ?? null
+    }
+    return null
+  }
+
+  const getApproxCaretMetrics = (
+    logicalLine: number,
+    column: number,
+    tokenLines: Token[][],
+  ): { targetY: number; caretX: number } | null => {
+    const layoutState = latestCaretLayoutSnapshot
+    if (!layoutState) return null
+    if (logicalLine < 0) return null
+
+    if (logicalLine >= layoutState.lineLayouts.length) {
+      if (logicalLine !== layoutState.lineLayouts.length) return null
+      return {
+        targetY: layoutState.totalHeight + settings.lineHeight + 1.5,
+        caretX: 0,
+      }
+    }
+
+    const logicalLayout = layoutState.lineLayouts[logicalLine]
+    if (!logicalLayout) return null
+
+    const yShift = logicalLayout.pendingYShift
+    const lineVisuals = logicalLayout.visualLines
+    if (lineVisuals.length === 0) {
+      return {
+        targetY: logicalLayout.startY + yShift + settings.lineHeight + 1.5,
+        caretX: 0,
+      }
+    }
+
+    let targetVisual = lineVisuals[lineVisuals.length - 1]
+    for (let i = 0; i < lineVisuals.length; i++) {
+      const visualLine = lineVisuals[i]
+      const lineStartColumn = getCharOffsetForVisualLine(logicalLine, visualLine, tokenLines)
+      let lineEndColumn = lineStartColumn
+      for (let j = 0; j < visualLine.tokens.length; j++) {
+        lineEndColumn += visualLine.tokens[j].token.text.length
+      }
+      const isLast = i === lineVisuals.length - 1
+      if (column >= lineStartColumn && (column < lineEndColumn || isLast)) {
+        targetVisual = visualLine
+        break
+      }
+    }
+
+    let caretX = 0
+    if (targetVisual.tokens.length > 0) {
+      const columnOffset = getCharOffsetForVisualLine(logicalLine, targetVisual, tokenLines)
+      let currentColumn = columnOffset
+      for (let i = 0; i < targetVisual.tokens.length; i++) {
+        const visualToken = targetVisual.tokens[i]
+        const tokenStartColumn = currentColumn
+        const tokenEndColumn = currentColumn + visualToken.token.text.length
+        if (column >= tokenStartColumn && column <= tokenEndColumn) {
+          const relativePos = column - tokenStartColumn
+          const tokenWidth = visualToken.tokenEndX - visualToken.x
+          const charWidth = visualToken.token.text.length > 0 ? tokenWidth / visualToken.token.text.length : 0
+          caretX = visualToken.x + relativePos * charWidth
+          break
+        }
+        if (column > tokenEndColumn && i === targetVisual.tokens.length - 1) {
+          caretX = visualToken.endX
+        }
+        currentColumn = tokenEndColumn
+      }
+    }
+
+    return {
+      targetY: targetVisual.y + yShift + settings.lineHeight + 1.5,
+      caretX,
+    }
+  }
+
+  const getApproxContentMetrics = (): { totalWidth: number; totalHeight: number } | null => {
+    const snapshot = latestCaretLayoutSnapshot
+    if (!snapshot) return null
+    return {
+      totalWidth: snapshot.totalWidth,
+      totalHeight: snapshot.totalHeight,
+    }
+  }
+
+  const getApproxVisibleLogicalRange = (
+    visibleTop: number,
+    visibleBottom: number,
+    scrollY: number,
+  ): { start: number; end: number } | null => {
+    const snapshot = latestCaretLayoutSnapshot
+    if (!snapshot) return null
+
+    const lineCount = snapshot.lineLayouts.length
+    if (lineCount === 0) return { start: 0, end: 0 }
+
+    const contentTop = visibleTop - scrollY
+    const contentBottom = visibleBottom - scrollY
+    if (!Number.isFinite(contentTop) || !Number.isFinite(contentBottom)) return null
+
+    const heightIndex = snapshot.heightIndex
+    const epsilon = 0.001
+    const margin = settings.lineHeight
+
+    let start = heightIndex.lowerBound(Math.max(0, contentTop - epsilon))
+    if (start < 0) start = 0
+    if (start >= lineCount) start = lineCount - 1
+
+    let end = heightIndex.lowerBound(Math.max(0, contentBottom + margin))
+    if (end < start) end = start
+    if (end >= lineCount) end = lineCount - 1
+
+    return { start, end }
+  }
+
+  return { visualLines, visualLinesByLogicalLine, totalWidth, totalHeight, getVisibleVisualLines,
+    getLastVisualLine, getFirstVisualLine, getApproxCaretMetrics, getApproxContentMetrics,
+    getApproxVisibleLogicalRange }
 }

@@ -13,6 +13,7 @@ import {
   getXFromColumn,
 } from './line-utils.ts'
 import type { Lines, VisualLine } from './lines.ts'
+import { measureText } from './measure.ts'
 import type { Metrics } from './metrics.ts'
 import type { Scroll } from './scroll.ts'
 import type { Selection } from './selection.ts'
@@ -52,6 +53,11 @@ export function createKeyboard(
   const ctrlKey = signal(false)
   const metaKey = signal(false)
   const altKey = signal(false)
+  const pressedInputKeys = new Set<string>()
+
+  const updateKeyHoldActive = () => {
+    doc.keyHoldActive = pressedInputKeys.size > 0
+  }
 
   function insertText(text: string) {
     if (selection.hasSelection.value) {
@@ -125,10 +131,6 @@ export function createKeyboard(
       const linesBeforeInsert = doc.lines.length
 
       adjustWidgetsOnLineSplit(doc, insertLine, insertColumn, newlineCount)
-      caches.invalidateWrapTokensCacheForLine(insertLine)
-      for (const [lineNum] of caches.wrapTokensCacheByLine.entries()) {
-        if (lineNum > insertLine) caches.invalidateWrapTokensCacheForLine(lineNum)
-      }
 
       doc.buffer.insert(insertLine, insertColumn, text)
 
@@ -136,6 +138,7 @@ export function createKeyboard(
       const insertedLineCount = linesAfterInsert - linesBeforeInsert
 
       if (insertedLineCount > 0) {
+        caches.adjustWrapTokensCacheOnLineInsertRange(insertLine + 1, insertLine + insertedLineCount)
         blocks.adjustOnLineInsertRange(insertLine + 1, insertLine + insertedLineCount)
       }
 
@@ -1504,57 +1507,138 @@ export function createKeyboard(
 
     if (currentLine < 0 || currentLine >= codeLines.length) return
 
-    let visualLine = findVisualLineForColumn(
-      lines,
-      currentLine,
-      currentColumn,
-      doc.tokenLines,
-      caches,
-    )
+    const canUseNoWrapFastPath = !settings.wordWrap
+      && doc.collapsed.size === 0
+      && doc.widgets.length === 0
+      && doc.errors.length === 0
+    const canUseApproxCaretFastPath = typeof lines.getApproxCaretMetrics === 'function'
 
-    if (!visualLine) {
-      const visualLines = lines.visualLines.value
-      const relevantLines = lines.visualLinesByLogicalLine.value.get(currentLine) ?? []
-      if (relevantLines.length > 0) {
-        visualLine = relevantLines[0]
+    let targetY: number
+    let caretX: number
+
+    if (canUseNoWrapFastPath) {
+      const lineLength = codeLines[currentLine]?.length ?? 0
+      const clampedColumn = Math.max(0, Math.min(currentColumn, lineLength))
+      targetY = (currentLine * settings.lineHeight) + settings.lineHeight + 1.5
+
+      if (clampedColumn === 0) {
+        caretX = 0
       }
       else {
-        const lastVisualLine = visualLines[visualLines.length - 1]
-        if (lastVisualLine && currentLine === lastVisualLine.logicalLine + 1) {
-          visualLine = {
-            tokens: [],
-            logicalLine: currentLine,
-            tokenOffset: 0,
-            y: lastVisualLine.y + lastVisualLine.height,
-            width: 0,
-            height: settings.lineHeight,
-            widgets: {
-              above: [],
-              below: [],
-              full: [],
-              overlay: [],
-              inlay: [],
-              beforeAfter: [],
-            },
-            errors: [],
+        const lineTokens = doc.tokenLines[currentLine] ?? []
+        let x = 0
+        let tokenStartColumn = 0
+        let found = false
+
+        for (let i = 0; i < lineTokens.length; i++) {
+          const token = lineTokens[i]
+          const tokenLength = token.text.length
+          const tokenEndColumn = tokenStartColumn + tokenLength
+          const tokenWidth = measureText(canvas.c, settings, caches, token).width
+
+          if (clampedColumn <= tokenEndColumn) {
+            const relativePos = Math.max(0, clampedColumn - tokenStartColumn)
+            const charWidth = tokenLength > 0 ? tokenWidth / tokenLength : 0
+            caretX = x + (relativePos * charWidth)
+            found = true
+            break
           }
+
+          x += tokenWidth
+          tokenStartColumn = tokenEndColumn
+        }
+
+        if (!found) {
+          caretX = x
+        }
+      }
+    }
+    else {
+      if (canUseApproxCaretFastPath) {
+        const approx = lines.getApproxCaretMetrics(currentLine, currentColumn, doc.tokenLines)
+        if (approx) {
+          targetY = approx.targetY
+          caretX = approx.caretX
         }
         else {
-          return
+          targetY = (currentLine * settings.lineHeight) + settings.lineHeight + 1.5
+          const lineLength = codeLines[currentLine]?.length ?? 0
+          const clampedColumn = Math.max(0, Math.min(currentColumn, lineLength))
+          if (clampedColumn === 0) {
+            caretX = 0
+          }
+          else {
+            const lineTokens = doc.tokenLines[currentLine] ?? []
+            let x = 0
+            let tokenStartColumn = 0
+            let found = false
+            for (let i = 0; i < lineTokens.length; i++) {
+              const token = lineTokens[i]
+              const tokenLength = token.text.length
+              const tokenEndColumn = tokenStartColumn + tokenLength
+              const tokenWidth = measureText(canvas.c, settings, caches, token).width
+              if (clampedColumn <= tokenEndColumn) {
+                const relativePos = Math.max(0, clampedColumn - tokenStartColumn)
+                const charWidth = tokenLength > 0 ? tokenWidth / tokenLength : 0
+                caretX = x + (relativePos * charWidth)
+                found = true
+                break
+              }
+              x += tokenWidth
+              tokenStartColumn = tokenEndColumn
+            }
+            if (!found) caretX = x
+          }
+        }
+      }
+      else {
+        targetY = (currentLine * settings.lineHeight) + settings.lineHeight + 1.5
+        const lineLength = codeLines[currentLine]?.length ?? 0
+        const clampedColumn = Math.max(0, Math.min(currentColumn, lineLength))
+        if (clampedColumn === 0) {
+          caretX = 0
+        }
+        else {
+          const lineTokens = doc.tokenLines[currentLine] ?? []
+          let x = 0
+          let tokenStartColumn = 0
+          let found = false
+          for (let i = 0; i < lineTokens.length; i++) {
+            const token = lineTokens[i]
+            const tokenLength = token.text.length
+            const tokenEndColumn = tokenStartColumn + tokenLength
+            const tokenWidth = measureText(canvas.c, settings, caches, token).width
+            if (clampedColumn <= tokenEndColumn) {
+              const relativePos = Math.max(0, clampedColumn - tokenStartColumn)
+              const charWidth = tokenLength > 0 ? tokenWidth / tokenLength : 0
+              caretX = x + (relativePos * charWidth)
+              found = true
+              break
+            }
+            x += tokenWidth
+            tokenStartColumn = tokenEndColumn
+          }
+          if (!found) caretX = x
         }
       }
     }
 
-    const targetY = visualLine.y + settings.lineHeight + 1.5
     const canvasHeight = canvas.size.height.value
     const scrollY = scroll.pos.y
     const caretY = targetY + scrollY
 
-    const needsVertical = lines.totalHeight.value > canvas.size.height.value
+    const approxContentMetrics = typeof lines.getApproxContentMetrics === 'function'
+      ? lines.getApproxContentMetrics()
+      : null
+    const estimatedTotalHeight = approxContentMetrics?.totalHeight
+      ?? Math.max(targetY, codeLines.length * settings.lineHeight)
+    const needsVertical = estimatedTotalHeight > canvas.size.height.value
     const availableWidth = canvas.size.width.value - settings.paddingLeft
       - metrics.gutterWidth.value
       - (needsVertical ? VERTICAL_SCROLLBAR_SIZE : 0)
-    const needsHorizontal = !settings.wordWrap && lines.totalWidth.value > availableWidth
+    const estimatedTotalWidth = approxContentMetrics?.totalWidth
+      ?? (settings.wordWrap ? availableWidth : Math.max(availableWidth, caretX + 2))
+    const needsHorizontal = !settings.wordWrap && estimatedTotalWidth > availableWidth
 
     const headerHeight = header.value?.height ?? 0
     const rightMargin = settings.caretMarginX
@@ -1572,7 +1656,6 @@ export function createKeyboard(
       scroll.targetY.value = -targetY + bottomMargin
     }
 
-    const caretX = getXFromColumn(lines, visualLine, currentColumn, doc.tokenLines, canvas, settings, caches)
     const contentWidth = availableWidth
     const scrollX = scroll.pos.x
     const caretXInView = caretX + scrollX
@@ -2301,6 +2384,7 @@ export function createKeyboard(
     }
     else if ((ctrl || meta) && key === 'z' && !shift) {
       const result = doc.buffer.undo()
+      caches.clearDrawCaches()
       if (result) {
         caret.line.value = result.line
         caret.column.value = result.column
@@ -2328,6 +2412,7 @@ export function createKeyboard(
     }
     else if ((ctrl || meta) && (key === 'y' || (key === 'z' && shift))) {
       const result = doc.buffer.redo()
+      caches.clearDrawCaches()
       if (result) {
         caret.line.value = result.line
         caret.column.value = result.column
@@ -2750,6 +2835,9 @@ export function createKeyboard(
         return
       }
 
+      pressedInputKeys.add(event.code || event.key)
+      updateKeyHoldActive()
+
       handleKeyAction(event.key, event.shiftKey, event.ctrlKey, event.metaKey, event.altKey)
 
       if (
@@ -2789,6 +2877,11 @@ export function createKeyboard(
       ctrlKey.value = event.ctrlKey
       metaKey.value = event.metaKey
       altKey.value = event.altKey
+
+      if (!NON_KEYS.has(event.key)) {
+        pressedInputKeys.delete(event.code || event.key)
+        updateKeyHoldActive()
+      }
     })
   }
 
@@ -2804,6 +2897,8 @@ export function createKeyboard(
 
   const handleTextareaBlur = () => {
     setTimeout(() => {
+      pressedInputKeys.clear()
+      updateKeyHoldActive()
       const activeElement = document.activeElement
       const textarea = getTextareaElement()
       if (activeElement !== textarea && activeElement?.tagName !== 'CANVAS' && getActiveCanvas() !== canvas.el) {
@@ -2822,6 +2917,8 @@ export function createKeyboard(
   textarea.addEventListener('blur', handleTextareaBlur)
 
   const dispose = () => {
+    pressedInputKeys.clear()
+    updateKeyHoldActive()
     textarea.removeEventListener('focus', handleTextareaFocus)
     textarea.removeEventListener('blur', handleTextareaBlur)
     clipboard.dispose()

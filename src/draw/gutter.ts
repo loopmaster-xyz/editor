@@ -6,27 +6,30 @@ import type { Lines, VisualLine } from '../lines.ts'
 import type { Scroll } from '../scroll.ts'
 import type { Settings } from '../settings.ts'
 import { getActiveCanvas } from '../textarea-singleton.ts'
-import { shouldBreakBottom } from './widget.ts'
+import { drawText } from './util.ts'
 
 const COLLAPSE_TOGGLE_SIZE = 11
 const COLLAPSE_TOGGLE_RIGHT_MARGIN = 5
 
-function lowerBoundVisualLineBottomAtLeast(visualLines: VisualLine[], minBottomY: number): number {
-  let low = 0
-  let high = visualLines.length
-
-  while (low < high) {
-    const mid = (low + high) >> 1
-    const line = visualLines[mid]
-    if (line.y + line.height < minBottomY) {
-      low = mid + 1
-    }
-    else {
-      high = mid
-    }
+function getVisibleVisualLinesForRange(
+  lines: Pick<Lines, 'visualLines'> & Partial<Pick<Lines, 'getVisibleVisualLines'>>,
+  visibleTop: number,
+  visibleBottom: number,
+  scrollY: number,
+): VisualLine[] {
+  if (typeof lines.getVisibleVisualLines === 'function') {
+    return lines.getVisibleVisualLines(visibleTop, visibleBottom, scrollY)
   }
+  return lines.visualLines.value
+}
 
-  return low
+function getLastVisualLine(
+  lines: Pick<Lines, 'visualLines'> & Partial<Pick<Lines, 'getLastVisualLine'>>,
+): VisualLine | null {
+  if (typeof lines.getLastVisualLine === 'function') {
+    return lines.getLastVisualLine()
+  }
+  return lines.visualLines.value.at(-1) ?? null
 }
 
 export function drawGutterBackground(context: Context) {
@@ -52,7 +55,7 @@ export function drawGutter(context: Context) {
   if (!context.settings.showGutter) return
   const { canvas, lines, caret, settings, gutter, doc, header, caches } = context
   const { c } = canvas
-  const visualLines = lines.visualLines.value
+  const visualLinesByLogicalLine = lines.visualLinesByLogicalLine.value
   const currentLine = caret.line.value
   const currentColumn = caret.column.value
   const collapsedLines = doc.collapsed
@@ -63,9 +66,12 @@ export function drawGutter(context: Context) {
   const headerHeight = header.value?.height ?? 0
   const visibleTop = -headerHeight - paddingTop
   const visibleBottom = height - paddingTop
-  const lineNumberMap = gutter.lineNumberMap.value
   const blockStarts = gutter.blockStarts.value
-  const lineNumberMetrics = gutter.lineNumberMetrics.value
+  const visibleVisualLines = lines.getVisibleVisualLines(visibleTop, visibleBottom, scrollY)
+  const visibleLogicalLines = new Set<number>()
+  for (let i = 0; i < visibleVisualLines.length; i++) {
+    visibleLogicalLines.add(visibleVisualLines[i].logicalLine)
+  }
 
   const activeCanvas = getActiveCanvas()
   const isFocused = activeCanvas === canvas.el
@@ -75,43 +81,40 @@ export function drawGutter(context: Context) {
     : null
 
   c.save()
+  c.font = `${settings.fontSize} ${settings.fontFamilyName}`
+  c.textBaseline = 'top'
+  c.fillStyle = 'rgba(255, 255, 255, 0.05)'
 
-  const startIndex = lowerBoundVisualLineBottomAtLeast(visualLines, visibleTop - scrollY)
-  for (let i = startIndex; i < visualLines.length; i++) {
-    const visualLine = visualLines[i]
+  if (currentVisualLine) {
+    const currentLineY = currentVisualLine.y + scrollY
+    if (currentLineY + currentVisualLine.height >= visibleTop && currentLineY <= visibleBottom) {
+      c.fillRect(-settings.paddingLeft, currentLineY, gutterWidth + settings.paddingLeft, settings.lineHeight)
+    }
+  }
+
+  const showCollapseToggles = !!context.mouse.hovered.gutter
+  for (const logicalLine of visibleLogicalLines) {
+    const lineVisualLines = visualLinesByLogicalLine[logicalLine] ?? []
+    const visualLine = lineVisualLines[0]
+    if (!visualLine) continue
+
     const lineY = visualLine.y + scrollY
-    if (shouldBreakBottom(visualLines, visualLine, lineY, visibleBottom, scrollY)) break
+    if (lineY + visualLine.height < visibleTop || lineY > visibleBottom) continue
 
-    const logicalLine = visualLine.logicalLine
-    const isFirstVisualLine = lineNumberMap.get(logicalLine)?.[0] === visualLine
     const hasError = visualLine.errors.length > 0
-    const isCurrentVisualLine = visualLine.y === currentVisualLine?.y
     const isCollapsed = collapsedLines.has(logicalLine)
     const canCollapse = blockStarts.has(logicalLine)
-
-    if (isCurrentVisualLine) {
-      c.fillStyle = 'rgba(255, 255, 255, 0.05)'
-      c.fillRect(-settings.paddingLeft, lineY, gutterWidth + settings.paddingLeft, settings.lineHeight)
-    }
-
-    if (!isFirstVisualLine) continue
 
     // if (hasError) {
     //   c.fillStyle = '#f00'
     //   c.fillRect(-settings.paddingLeft, lineY, gutterWidth + settings.paddingLeft, visualLine.height)
     // }
 
-    const metrics = lineNumberMetrics.get(logicalLine)
-    if (metrics) {
-      const lineNumberY = lineY + 2
+    const metrics = gutter.getLineNumberMetric(logicalLine)
+    const lineNumberY = lineY + 2
+    drawText(c, metrics.text, metrics.x, lineNumberY, hasError ? '#f00' : 'rgba(255, 255, 255, 0.3)')
 
-      c.fillStyle = hasError ? '#f00' : 'rgba(255, 255, 255, 0.3)'
-      c.font = `${settings.fontSize} ${settings.fontFamilyName}`
-      c.textBaseline = 'top'
-      c.fillText(metrics.text, metrics.x, lineNumberY)
-    }
-
-    if (canCollapse && (isCollapsed || context.mouse.hovered.gutter)) {
+    if (canCollapse && (isCollapsed || showCollapseToggles)) {
       const toggleX = gutterWidth - COLLAPSE_TOGGLE_SIZE - COLLAPSE_TOGGLE_RIGHT_MARGIN
       const toggleY = lineY + 6.5
       const size = COLLAPSE_TOGGLE_SIZE - 4
@@ -145,27 +148,23 @@ export function drawGutter(context: Context) {
 
   const codeLines = context.doc.lines
   const lastLineIndex = codeLines.length - 1
-  if (lastLineIndex >= 0 && !lineNumberMap.has(lastLineIndex)) {
-    const lastVisualLine = visualLines[visualLines.length - 1]
+  const lastVisualLines = lastLineIndex >= 0 ? (visualLinesByLogicalLine[lastLineIndex] ?? []) : []
+  if (lastLineIndex >= 0 && lastVisualLines.length === 0) {
+    const lastVisualLine = getLastVisualLine(lines)
     if (lastVisualLine) {
       const lineY = lastVisualLine.y + lastVisualLine.height + scrollY
       if (lineY >= -paddingTop && lineY <= visibleBottom) {
         const isCurrentVisualLine = isFocused && lastLineIndex === currentLine
           && currentVisualLine?.logicalLine === lastLineIndex
-        const metrics = lineNumberMetrics.get(lastLineIndex)
+        const metrics = gutter.getLineNumberMetric(lastLineIndex)
 
         if (isCurrentVisualLine) {
           c.fillStyle = 'rgba(255, 255, 255, 0.05)'
           c.fillRect(-settings.paddingLeft, lineY, gutterWidth + settings.paddingLeft, settings.lineHeight)
         }
 
-        if (metrics) {
-          const lineNumberY = lineY + 2
-          c.fillStyle = 'rgba(255, 255, 255, 0.3)'
-          c.font = `${settings.fontSize} ${settings.fontFamilyName}`
-          c.textBaseline = 'top'
-          c.fillText(metrics.text, metrics.x, lineNumberY)
-        }
+        const lineNumberY = lineY + 2
+        drawText(c, metrics.text, metrics.x, lineNumberY, 'rgba(255, 255, 255, 0.3)')
       }
     }
   }
@@ -198,21 +197,18 @@ export function hitTestGutter(
   }
 
   const relativeY = y - headerHeight - paddingTop
-  const visualLines = lines.visualLines.value
-  const lineNumberMap = gutter.lineNumberMap.value
+  const visibleTop = -headerHeight - paddingTop
+  const visibleBottom = canvas.size.height.value - paddingTop
+  const visualLines = getVisibleVisualLinesForRange(lines, visibleTop, visibleBottom, scrollY)
   const blockStarts = gutter.blockStarts.value
 
-  const visibleTop = -paddingTop
-  const visibleBottom = canvas.size.height.value - headerHeight - paddingTop
-  const startIndex = lowerBoundVisualLineBottomAtLeast(visualLines, visibleTop - scrollY)
-  for (let i = startIndex; i < visualLines.length; i++) {
+  for (let i = 0; i < visualLines.length; i++) {
     const visualLine = visualLines[i]
     const lineY = visualLine.y + scrollY
-    if (shouldBreakBottom(visualLines, visualLine, lineY, visibleBottom, scrollY)) break
 
     if (relativeY >= lineY && relativeY < lineY + visualLine.height) {
       const logicalLine = visualLine.logicalLine
-      const isFirstVisualLine = lineNumberMap.get(logicalLine)?.[0] === visualLine
+      const isFirstVisualLine = visualLine.tokenOffset === 0
       const canCollapse = blockStarts.has(logicalLine)
 
       if (canCollapse && isFirstVisualLine) {

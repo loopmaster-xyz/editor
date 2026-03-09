@@ -100,6 +100,7 @@ const defaultSettings = {
   blockComment: ['/*', '*/'] as [string, string],
   minGutterDigits: 2,
   showGutter: true,
+  performanceMode: 'normal' as 'normal' | 'large' | 'stress',
 }
 
 export function createSettings(editorSettings: Partial<EditorSettings> = {}) {
@@ -116,8 +117,8 @@ export function createSettings(editorSettings: Partial<EditorSettings> = {}) {
         background: this.colors.black,
         blockColors: [
           this.colors.brightYellow,
-          this.colors.brightBlue,
           this.colors.brightPurple,
+          this.colors.brightBlue,
         ],
       }
     },

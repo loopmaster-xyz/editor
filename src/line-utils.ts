@@ -6,10 +6,25 @@ import type { Settings } from './settings.ts'
 import type { Token } from './token.ts'
 
 const visualLineCharOffsetCache = new WeakMap<VisualLine, number>()
+const visualLineEmptyCache = new WeakMap<VisualLine, boolean>()
+const NON_WHITESPACE_RE = /\S/
 
 export function isLineEmpty(line: VisualLine): boolean {
-  if (line.tokens.length === 0) return true
-  return line.tokens.every(token => token.token.text.trim() === '')
+  const cached = visualLineEmptyCache.get(line)
+  if (cached !== undefined) return cached
+
+  let isEmpty = true
+  if (line.tokens.length > 0) {
+    for (let i = 0; i < line.tokens.length; i++) {
+      if (NON_WHITESPACE_RE.test(line.tokens[i].token.text)) {
+        isEmpty = false
+        break
+      }
+    }
+  }
+
+  visualLineEmptyCache.set(line, isEmpty)
+  return isEmpty
 }
 
 export function findVisualLineForLogicalLine(
@@ -36,7 +51,7 @@ export function findVisualLineForColumn(
   }
 
   const visualLinesByLogicalLine = lines.visualLinesByLogicalLine.value
-  const relevantLines = visualLinesByLogicalLine.get(logicalLine) ?? []
+  const relevantLines = visualLinesByLogicalLine[logicalLine] ?? []
   if (relevantLines.length === 0) {
     return null
   }
@@ -85,7 +100,7 @@ export function getCharOffsetForVisualLine(
   }
   if (lines) {
     const visualLinesByLogicalLine = lines.visualLinesByLogicalLine.value
-    const allVisualLines = visualLinesByLogicalLine.get(logicalLine) ?? []
+    const allVisualLines = visualLinesByLogicalLine[logicalLine] ?? []
     for (const prevLine of allVisualLines) {
       if (prevLine === visualLine) break
       for (const token of prevLine.tokens) {

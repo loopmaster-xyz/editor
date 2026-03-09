@@ -1,4 +1,4 @@
-import { batch, computed, signal, untracked } from '@preact/signals-core'
+import { batch, signal, untracked } from '@preact/signals-core'
 import { SkipString } from './lib/skip-string.ts'
 
 export type Buffer = ReturnType<typeof createBuffer>
@@ -13,6 +13,8 @@ export type BufferChange = {
   start: number
   deletedText: string
   insertedText: string
+  startLine?: number
+  startColumn?: number
 } | {
   type: 'reset'
   prevCode: string
@@ -23,15 +25,31 @@ export type BufferChangeListener = (change: BufferChange) => void
 
 function spliceChangeForOp(op: BufferOp): BufferChange {
   if (op.type === BufferOpType.Insert) {
-    return { type: 'splice', start: op.index, deletedText: '', insertedText: op.text }
+    return {
+      type: 'splice',
+      start: op.index,
+      deletedText: '',
+      insertedText: op.text,
+      startLine: op.startLine,
+      startColumn: op.startColumn,
+    }
   }
-  return { type: 'splice', start: op.start, deletedText: op.text, insertedText: '' }
+  return {
+    type: 'splice',
+    start: op.start,
+    deletedText: op.text,
+    insertedText: '',
+    startLine: op.startLine,
+    startColumn: op.startColumn,
+  }
 }
 
 export type BufferOp = {
   type: BufferOpType.Insert
   index: number
   text: string
+  startLine?: number
+  startColumn?: number
   replace?: boolean
   selection?: { start: { line: number; column: number }; end: { line: number; column: number };
     direction: 'forward' | 'backward' }
@@ -41,6 +59,8 @@ export type BufferOp = {
   start: number
   end: number
   text: string
+  startLine?: number
+  startColumn?: number
   replace?: boolean
   selection?: { start: { line: number; column: number }; end: { line: number; column: number };
     direction: 'forward' | 'backward' }
@@ -84,6 +104,99 @@ function lineColumnFromIndex(code: string, index: number): [line: number, column
   return [line, column]
 }
 
+function analyzeTextForLineSplice(text: string): { lineBreaks: number; tailLength: number } {
+  let lineBreaks = 0
+  let tailLength = 0
+
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === '\n') {
+      lineBreaks++
+      tailLength = 0
+    }
+    else {
+      tailLength++
+    }
+  }
+
+  return { lineBreaks, tailLength }
+}
+
+function resolveLineColumnAtIndex(
+  lines: string[],
+  index: number,
+  lineHint?: number,
+  columnHint?: number,
+): { line: number; column: number } {
+  if (lines.length === 0) {
+    return { line: 0, column: 0 }
+  }
+
+  if (lineHint !== undefined && columnHint !== undefined) {
+    const line = Math.max(0, Math.min(lineHint, lines.length - 1))
+    const maxColumn = lines[line]?.length ?? 0
+    return { line, column: Math.max(0, Math.min(columnHint, maxColumn)) }
+  }
+
+  let remaining = Math.max(0, index)
+  for (let line = 0; line < lines.length; line++) {
+    const lineLength = lines[line]?.length ?? 0
+    if (remaining <= lineLength) {
+      return { line, column: remaining }
+    }
+    remaining -= lineLength + 1
+  }
+
+  const lastLine = lines.length - 1
+  return { line: lastLine, column: lines[lastLine]?.length ?? 0 }
+}
+
+function applySpliceToLinesInPlace(
+  lines: string[],
+  start: number,
+  deletedText: string,
+  insertedText: string,
+  startLineHint?: number,
+  startColumnHint?: number,
+): { startLine: number; startColumn: number } {
+  if (lines.length === 0) lines.push('')
+
+  const startPos = resolveLineColumnAtIndex(lines, start, startLineHint, startColumnHint)
+  const startLine = Math.max(0, Math.min(startPos.line, lines.length - 1))
+  const startLineText = lines[startLine] ?? ''
+  const startColumn = Math.max(0, Math.min(startPos.column, startLineText.length))
+
+  const deletedInfo = analyzeTextForLineSplice(deletedText)
+  let deletedEndLine = startLine + deletedInfo.lineBreaks
+  if (deletedEndLine < startLine) deletedEndLine = startLine
+  if (deletedEndLine >= lines.length) deletedEndLine = lines.length - 1
+
+  const deletedEndLineText = lines[deletedEndLine] ?? ''
+  const rawDeletedEndColumn = deletedInfo.lineBreaks === 0
+    ? startColumn + deletedInfo.tailLength
+    : deletedInfo.tailLength
+  const deletedEndColumn = Math.max(0, Math.min(rawDeletedEndColumn, deletedEndLineText.length))
+
+  const prefix = startLineText.slice(0, startColumn)
+  const suffix = deletedEndLineText.slice(deletedEndColumn)
+  const firstNewline = insertedText.indexOf('\n')
+
+  let replacement: string[]
+  if (firstNewline === -1) {
+    replacement = [prefix + insertedText + suffix]
+  }
+  else {
+    replacement = insertedText.split('\n')
+    replacement[0] = prefix + replacement[0]
+    replacement[replacement.length - 1] = replacement[replacement.length - 1] + suffix
+  }
+
+  const deleteCount = Math.max(1, deletedEndLine - startLine + 1)
+  lines.splice(startLine, deleteCount, ...replacement)
+  if (lines.length === 0) lines.push('')
+
+  return { startLine, startColumn }
+}
+
 export function createBuffer(bufferCode: string) {
   const skipString = new SkipString()
   skipString.set(bufferCode)
@@ -103,35 +216,130 @@ export function createBuffer(bufferCode: string) {
     })
   }
 
-  const codeSignal = signal(bufferCode)
+  const codeVersion = signal(0)
+  let codeCache = bufferCode
+  let codeDirty = false
+  let codeLength = bufferCode.length
+  const linesState = bufferCode.split('\n')
+  const linesVersion = signal(0)
+
+  const getCode = () => {
+    if (codeDirty) {
+      codeCache = skipString.toString()
+      codeDirty = false
+    }
+    return codeCache
+  }
+
+  const applySpliceState = (
+    start: number,
+    deletedText: string,
+    insertedText: string,
+    startLineHint?: number,
+    startColumnHint?: number,
+  ) => {
+    if (deletedText.length === 0 && insertedText.length === 0) return null
+
+    const clampedStart = Math.max(0, Math.min(start, codeLength))
+    const removedLength = Math.max(0, Math.min(deletedText.length, codeLength - clampedStart))
+    if (removedLength === 0 && insertedText.length === 0) return null
+
+    const { startLine, startColumn } = applySpliceToLinesInPlace(
+      linesState,
+      clampedStart,
+      deletedText,
+      insertedText,
+      startLineHint,
+      startColumnHint,
+    )
+    const removedText = removedLength === deletedText.length ? deletedText : deletedText.slice(0, removedLength)
+    codeLength = codeLength - removedLength + insertedText.length
+    codeDirty = true
+
+    batch(() => {
+      codeVersion.value++
+      linesVersion.value++
+    })
+
+    return {
+      start: clampedStart,
+      deletedText: removedText,
+      insertedText,
+      startLine,
+      startColumn,
+    }
+  }
+
   const code = {
     get value() {
-      return codeSignal.value
+      codeVersion.value
+      return getCode()
     },
     set value(value: string) {
-      const prevCode = codeSignal.peek()
+      const prevCode = getCode()
       if (value === prevCode) return
       skipString.set(value)
+      const nextLines = value.split('\n')
+      linesState.length = 0
+      for (let i = 0; i < nextLines.length; i++) {
+        linesState.push(nextLines[i] ?? '')
+      }
+      codeCache = value
+      codeDirty = false
+      codeLength = value.length
       emitChange({ type: 'reset', prevCode, nextCode: value })
-      codeSignal.value = value
+      batch(() => {
+        codeVersion.value++
+        linesVersion.value++
+      })
     },
   }
-  const lines = computed(() => code.value.split('\n'))
+  const lines = {
+    get value() {
+      linesVersion.value
+      return linesState
+    },
+  }
   const history = signal<BufferOp[]>([])
   const index = signal(-1)
 
   let mergeTimestamp = -Infinity
 
-  const applyOp = (op: BufferOp) => {
+  const applyOp = (op: BufferOp, useHints = true) => {
     applyBufferOp(skipString, op)
-    codeSignal.value = skipString.toString()
+    let appliedSplice: { startLine: number; startColumn: number } | null = null
+    if (op.type === BufferOpType.Insert) {
+      const result = applySpliceState(
+        op.index,
+        '',
+        op.text,
+        useHints ? op.startLine : undefined,
+        useHints ? op.startColumn : undefined,
+      )
+      if (result) appliedSplice = { startLine: result.startLine, startColumn: result.startColumn }
+    }
+    else {
+      const result = applySpliceState(
+        op.start,
+        op.text,
+        '',
+        useHints ? op.startLine : undefined,
+        useHints ? op.startColumn : undefined,
+      )
+      if (result) appliedSplice = { startLine: result.startLine, startColumn: result.startColumn }
+    }
+
+    if (appliedSplice) {
+      if (op.startLine === undefined) op.startLine = appliedSplice.startLine
+      if (op.startColumn === undefined) op.startColumn = appliedSplice.startColumn
+    }
   }
 
   const apply = (op: BufferOp, merge = false) => {
     const prevOp = history.value[index.value]
     const now = Date.now()
 
-    applyOp(op)
+    applyOp(op, true)
 
     if (merge && prevOp && now - mergeTimestamp < 1000) {
       if (op.type === BufferOpType.Insert && prevOp.type === BufferOpType.Insert) {
@@ -143,6 +351,8 @@ export function createBuffer(bufferCode: string) {
                 type: BufferOpType.Insert,
                 index: prevOp.index,
                 text: prevOp.text + op.text,
+                startLine: prevOp.startLine ?? op.startLine,
+                startColumn: prevOp.startColumn ?? op.startColumn,
                 replace: true,
                 selection: prevOp.selection,
               }
@@ -163,6 +373,8 @@ export function createBuffer(bufferCode: string) {
             type: BufferOpType.Insert,
             index: prevOp.index,
             text: prevOp.text + op.text,
+            startLine: prevOp.startLine ?? op.startLine,
+            startColumn: prevOp.startColumn ?? op.startColumn,
             selection: prevOp.selection,
           }
           if (prevOp.caretIndex !== undefined) {
@@ -198,6 +410,8 @@ export function createBuffer(bufferCode: string) {
                   start: prevPrevDeleteOp.start,
                   end: prevPrevDeleteOp.end,
                   text: prevPrevDeleteOp.text,
+                  startLine: prevPrevDeleteOp.startLine ?? prevOp.startLine,
+                  startColumn: prevPrevDeleteOp.startColumn ?? prevOp.startColumn,
                   replace: true,
                   selection: prevPrevDeleteOp.selection,
                   caretIndex: prevPrevDeleteOp.caretIndex,
@@ -206,6 +420,8 @@ export function createBuffer(bufferCode: string) {
                   type: BufferOpType.Insert,
                   index: prevPrevOp.index,
                   text: op.text,
+                  startLine: op.startLine ?? prevPrevOp.startLine,
+                  startColumn: op.startColumn ?? prevPrevOp.startColumn,
                   replace: true,
                   selection: op.selection || prevPrevOp.selection,
                   caretIndex: op.caretIndex,
@@ -224,6 +440,8 @@ export function createBuffer(bufferCode: string) {
                   start: prevPrevDeleteOp.start,
                   end: prevOp.end,
                   text: prevPrevDeleteOp.text + prevOp.text,
+                  startLine: prevPrevDeleteOp.startLine ?? prevOp.startLine,
+                  startColumn: prevPrevDeleteOp.startColumn ?? prevOp.startColumn,
                   replace: true,
                   selection: prevPrevDeleteOp.selection || prevOp.selection,
                   caretIndex: prevPrevDeleteOp.caretIndex,
@@ -232,6 +450,8 @@ export function createBuffer(bufferCode: string) {
                   type: BufferOpType.Insert,
                   index: prevPrevOp.index,
                   text: prevPrevOp.text + op.text,
+                  startLine: prevPrevOp.startLine ?? op.startLine,
+                  startColumn: prevPrevOp.startColumn ?? op.startColumn,
                   replace: true,
                   selection: op.selection || prevPrevOp.selection,
                   caretIndex: op.caretIndex,
@@ -265,6 +485,24 @@ export function createBuffer(bufferCode: string) {
             text,
             selection: prevOp.selection,
           }
+          if (prevOp.startLine !== undefined || op.startLine !== undefined) {
+            mergedOp.startLine = Math.min(prevOp.startLine ?? op.startLine ?? 0, op.startLine ?? prevOp.startLine ?? 0)
+          }
+          if (mergedOp.startLine !== undefined) {
+            const sameStartLine = prevOp.startLine !== undefined && op.startLine !== undefined && prevOp.startLine === op.startLine
+            if (sameStartLine) {
+              if (prevOp.startColumn !== undefined || op.startColumn !== undefined) {
+                mergedOp.startColumn = Math.min(prevOp.startColumn ?? op.startColumn ?? 0,
+                  op.startColumn ?? prevOp.startColumn ?? 0)
+              }
+            }
+            else if (mergedOp.startLine === prevOp.startLine) {
+              mergedOp.startColumn = prevOp.startColumn
+            }
+            else if (mergedOp.startLine === op.startLine) {
+              mergedOp.startColumn = op.startColumn
+            }
+          }
           if (prevOp.caretIndex !== undefined) {
             mergedOp.caretIndex = prevOp.caretIndex
           }
@@ -295,17 +533,39 @@ export function createBuffer(bufferCode: string) {
     switch (op.type) {
       case BufferOpType.Insert: {
         skipString.remove([op.index, op.index + op.text.length])
-        codeSignal.value = skipString.toString()
-        emitChange({ type: 'splice', start: op.index, deletedText: op.text, insertedText: '' })
+        const removed = applySpliceState(op.index, op.text, '', undefined, undefined)
+        if (removed) {
+          if (op.startLine === undefined) op.startLine = removed.startLine
+          if (op.startColumn === undefined) op.startColumn = removed.startColumn
+        }
+        emitChange({
+          type: 'splice',
+          start: op.index,
+          deletedText: op.text,
+          insertedText: '',
+          startLine: op.startLine,
+          startColumn: op.startColumn,
+        })
         if (op.replace) {
           const deleteOp = history.value[index.value]
           if (deleteOp && deleteOp.type === BufferOpType.Delete) {
             skipString.insert(deleteOp.start, deleteOp.text)
-            codeSignal.value = skipString.toString()
+            const inserted = applySpliceState(deleteOp.start, '', deleteOp.text, undefined, undefined)
+            if (inserted) {
+              if (deleteOp.startLine === undefined) deleteOp.startLine = inserted.startLine
+              if (deleteOp.startColumn === undefined) deleteOp.startColumn = inserted.startColumn
+            }
             index.value--
-            emitChange({ type: 'splice', start: deleteOp.start, deletedText: '', insertedText: deleteOp.text })
+            emitChange({
+              type: 'splice',
+              start: deleteOp.start,
+              deletedText: '',
+              insertedText: deleteOp.text,
+              startLine: deleteOp.startLine,
+              startColumn: deleteOp.startColumn,
+            })
             if (deleteOp.selection) {
-              const lines = code.value.split('\n')
+              const lines = linesState
               const maxLine = Math.max(0, lines.length - 1)
               const startLine = Math.min(deleteOp.selection.start.line, maxLine)
               const endLine = Math.min(deleteOp.selection.end.line, maxLine)
@@ -327,9 +587,9 @@ export function createBuffer(bufferCode: string) {
               }
             }
             if (deleteOp.caretIndex !== undefined) {
-              const clampedCaretIndex = Math.min(deleteOp.caretIndex, code.value.length)
+              const clampedCaretIndex = Math.min(deleteOp.caretIndex, codeLength)
               const [line, column] = lineColumnFromIndex(code.value, clampedCaretIndex)
-              const lines = code.value.split('\n')
+              const lines = linesState
               const maxLine = Math.max(0, lines.length - 1)
               const maxColumn = lines[Math.min(line, maxLine)]?.length || 0
               return {
@@ -339,7 +599,7 @@ export function createBuffer(bufferCode: string) {
             }
             const caretIndex = deleteOp.start + deleteOp.text.length
             const [line, column] = lineColumnFromIndex(code.value, caretIndex)
-            const lines = code.value.split('\n')
+            const lines = linesState
             const maxLine = Math.max(0, lines.length - 1)
             const maxColumn = lines[Math.min(line, maxLine)]?.length || 0
             return {
@@ -348,9 +608,9 @@ export function createBuffer(bufferCode: string) {
             }
           }
           // Orphaned replace Insert op - just return position at op.index
-          const caretIndex = Math.min(op.index, code.value.length)
+          const caretIndex = Math.min(op.index, codeLength)
           const [line, column] = lineColumnFromIndex(code.value, caretIndex)
-          const lines = code.value.split('\n')
+          const lines = linesState
           const maxLine = Math.max(0, lines.length - 1)
           const maxColumn = lines[Math.min(line, maxLine)]?.length || 0
           return {
@@ -359,7 +619,7 @@ export function createBuffer(bufferCode: string) {
           }
         }
         if (op.selection) {
-          const lines = code.value.split('\n')
+          const lines = linesState
           const maxLine = Math.max(0, lines.length - 1)
           const startLine = Math.min(op.selection.start.line, maxLine)
           const endLine = Math.min(op.selection.end.line, maxLine)
@@ -382,7 +642,7 @@ export function createBuffer(bufferCode: string) {
         }
         if (op.caretIndex !== undefined) {
           const [line, column] = lineColumnFromIndex(code.value, op.caretIndex)
-          const lines = code.value.split('\n')
+          const lines = linesState
           const maxLine = Math.max(0, lines.length - 1)
           const maxColumn = lines[Math.min(line, maxLine)]?.length || 0
           return {
@@ -390,9 +650,9 @@ export function createBuffer(bufferCode: string) {
             column: Math.min(column, maxColumn),
           }
         }
-        const caretIndex = Math.min(op.index, code.value.length)
+        const caretIndex = Math.min(op.index, codeLength)
         const [line, column] = lineColumnFromIndex(code.value, caretIndex)
-        const lines = code.value.split('\n')
+        const lines = linesState
         const maxLine = Math.max(0, lines.length - 1)
         const maxColumn = lines[Math.min(line, maxLine)]?.length || 0
         return {
@@ -402,10 +662,21 @@ export function createBuffer(bufferCode: string) {
       }
       case BufferOpType.Delete: {
         skipString.insert(op.start, op.text)
-        codeSignal.value = skipString.toString()
-        emitChange({ type: 'splice', start: op.start, deletedText: '', insertedText: op.text })
+        const inserted = applySpliceState(op.start, '', op.text, undefined, undefined)
+        if (inserted) {
+          if (op.startLine === undefined) op.startLine = inserted.startLine
+          if (op.startColumn === undefined) op.startColumn = inserted.startColumn
+        }
+        emitChange({
+          type: 'splice',
+          start: op.start,
+          deletedText: '',
+          insertedText: op.text,
+          startLine: op.startLine,
+          startColumn: op.startColumn,
+        })
         if (op.selection) {
-          const lines = code.value.split('\n')
+          const lines = linesState
           const maxLine = Math.max(0, lines.length - 1)
           const startLine = Math.min(op.selection.start.line, maxLine)
           const endLine = Math.min(op.selection.end.line, maxLine)
@@ -428,7 +699,7 @@ export function createBuffer(bufferCode: string) {
         }
         if (op.caretIndex !== undefined) {
           const [line, column] = lineColumnFromIndex(code.value, op.caretIndex)
-          const lines = code.value.split('\n')
+          const lines = linesState
           const maxLine = Math.max(0, lines.length - 1)
           const maxColumn = lines[Math.min(line, maxLine)]?.length || 0
           return {
@@ -438,7 +709,7 @@ export function createBuffer(bufferCode: string) {
         }
         const caretIndex = op.start + op.text.length
         const [line, column] = lineColumnFromIndex(code.value, caretIndex)
-        const lines = code.value.split('\n')
+        const lines = linesState
         const maxLine = Math.max(0, lines.length - 1)
         const maxColumn = lines[Math.min(line, maxLine)]?.length || 0
         return {
@@ -456,16 +727,16 @@ export function createBuffer(bufferCode: string) {
     const op = history.value[index.value + 1]
     if (!op) return null
     index.value++
-    applyOp(op)
+    applyOp(op, false)
     emitChange(spliceChangeForOp(op))
     if (op.replace) {
       const nextOp = history.value[index.value + 1]
       if (nextOp && nextOp.type === BufferOpType.Insert && nextOp.replace) {
         index.value++
-        applyOp(nextOp)
+        applyOp(nextOp, false)
         emitChange(spliceChangeForOp(nextOp))
         if (nextOp.selection) {
-          const lines = code.value.split('\n')
+          const lines = linesState
           const maxLine = Math.max(0, lines.length - 1)
           const startLine = Math.min(nextOp.selection.start.line, maxLine)
           const endLine = Math.min(nextOp.selection.end.line, maxLine)
@@ -526,20 +797,38 @@ export function createBuffer(bufferCode: string) {
 
   const insert = (line: number, column: number, text: string) => {
     const raw = indexFromLineColumn(lines.value, line, column)
-    const index = Math.max(0, Math.min(raw, code.value.length))
-    apply({ type: BufferOpType.Insert, index, text }, true)
+    const index = Math.max(0, Math.min(raw, codeLength))
+    apply({ type: BufferOpType.Insert, index, text, startLine: line, startColumn: column }, true)
   }
 
   const del = (line: number, column: number) => {
     const index = indexFromLineColumn(lines.value, line, column)
     const char = skipString.substring(index, index + 1)
-    apply({ type: BufferOpType.Delete, start: index, end: index + 1, text: char, caretIndex: index }, true)
+    apply({
+      type: BufferOpType.Delete,
+      start: index,
+      end: index + 1,
+      text: char,
+      caretIndex: index,
+      startLine: line,
+      startColumn: column,
+    }, true)
   }
 
   const backspace = (line: number, column: number) => {
     const index = indexFromLineColumn(lines.value, line, column)
     const char = skipString.substring(index - 1, index)
-    apply({ type: BufferOpType.Delete, start: index - 1, end: index, text: char, caretIndex: index }, true)
+    const startLine = Math.max(0, column > 0 ? line : line - 1)
+    const startColumn = column > 0 ? column - 1 : (lines.value[startLine]?.length ?? 0)
+    apply({
+      type: BufferOpType.Delete,
+      start: index - 1,
+      end: index,
+      text: char,
+      caretIndex: index,
+      startLine,
+      startColumn,
+    }, true)
   }
 
   const deleteSelection = (start: { line: number; column: number }, end: { line: number; column: number },
@@ -552,7 +841,8 @@ export function createBuffer(bufferCode: string) {
     const caretIndex = caretPosition
       ? indexFromLineColumn(lines.value, caretPosition.line, caretPosition.column)
       : undefined
-    apply({ type: BufferOpType.Delete, start: startIndex, end: endIndex, text, selection, caretIndex }, merge)
+    apply({ type: BufferOpType.Delete, start: startIndex, end: endIndex, text, selection, caretIndex,
+      startLine: start.line, startColumn: start.column }, merge)
   }
 
   const replace = (index: number, length: number, text: string) => {
@@ -582,19 +872,18 @@ export function createBuffer(bufferCode: string) {
 
     const afterCaretIndex = caretPositionAfter !== undefined
       ? (() => {
-        const tempSkipString = skipString.copy()
-        tempSkipString.remove([startIndex, endIndex])
-        tempSkipString.insert(startIndex, text)
-        const newCode = tempSkipString.toString()
+        const currentCode = code.value
+        const newCode = currentCode.slice(0, startIndex) + text + currentCode.slice(endIndex)
         const newLines = newCode.split('\n')
         return indexFromLineColumn(newLines, caretPositionAfter.line, caretPositionAfter.column)
       })()
       : undefined
 
     const deleteOp: BufferOp = { type: BufferOpType.Delete, start: startIndex, end: endIndex, text: deletedText,
-      replace: true, selection: selectionBefore, caretIndex: beforeCaretIndex }
+      replace: true, selection: selectionBefore, caretIndex: beforeCaretIndex, startLine: start.line,
+      startColumn: start.column }
     const insertOp: BufferOp = { type: BufferOpType.Insert, index: startIndex, text: text, replace: true,
-      selection: selectionAfter, caretIndex: afterCaretIndex }
+      selection: selectionAfter, caretIndex: afterCaretIndex, startLine: start.line, startColumn: start.column }
 
     const now = Date.now()
     batch(() => {

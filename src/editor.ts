@@ -9,7 +9,7 @@ import { disposables } from './lib/disposables.ts'
 import { createRender, type Render } from './render.ts'
 import type { EditorSettings } from './settings.ts'
 import type { Token } from './token.ts'
-import { tokenize } from './tokenizer.ts'
+import { defaultIncrementalTokenizer } from './tokenizer.ts'
 import { warmup } from './warmup.ts'
 
 export { Position } from './context.ts'
@@ -33,7 +33,7 @@ export type Editor = ReturnType<typeof createEditor>
 export const activeEditor = activeEditorSignal as Signal<Editor | null>
 
 export function createEditor(settings: Partial<EditorSettings> = {}) {
-  const doc = createDoc(tokenize)
+  const doc = createDoc(defaultIncrementalTokenizer)
   const editorRef = { current: null as Editor | null }
   const context = createContext(settings, doc, {
     editorRef,

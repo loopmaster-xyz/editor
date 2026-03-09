@@ -7,7 +7,6 @@ import type { Caret } from './caret.ts'
 import type { Doc, DocError } from './doc.ts'
 import { hitTestGutter } from './draw/gutter.ts'
 import { hitTestScrollbar } from './draw/scrollbar.ts'
-import { getAboveHeight } from './draw/widget.ts'
 import type { Gutter } from './gutter.ts'
 import type { Header } from './header.ts'
 import { signalify } from './lib/signalify.ts'
@@ -565,9 +564,17 @@ export function createMouse(
     }
   }
 
+  const getInteractiveVisualLines = (extraMarginLines = 4): VisualLine[] => {
+    const headerHeight = header.value?.height ?? 0
+    const margin = settings.lineHeight * extraMarginLines
+    const visibleTop = -headerHeight - settings.paddingTop - margin
+    const visibleBottom = canvas.size.height.value - settings.paddingTop + margin
+    return lines.getVisibleVisualLines(visibleTop, visibleBottom, scroll.pos.y)
+  }
+
   const findLineColumnFromPosition = (x: number, y: number): { line: VisualLine; column: number } | null => {
     const headerHeight = header.value?.height ?? 0
-    const visualLines = lines.visualLines.value
+    const visualLines = getInteractiveVisualLines()
     const scrollY = scroll.pos.y
     const scrollX = scroll.pos.x
 
@@ -597,14 +604,14 @@ export function createMouse(
   }
 
   const getAboveHeightForLine = (line: VisualLine): number => {
-    return getAboveHeight(lines.visualLines.value, line)
+    return line.aboveHeight ?? line.logicalAboveHeight ?? 0
   }
 
   const findBelowWidgetHit = (x: number, y: number): { widget: Widget & { type: 'below' }; canvasX: number;
     canvasY: number; canvasW: number; canvasH: number } | null =>
   {
     const headerHeight = header.value?.height ?? 0
-    const visualLines = lines.visualLines.value
+    const visualLines = getInteractiveVisualLines()
     const scrollY = scroll.pos.y
     const scrollX = scroll.pos.x
     const worldY = y - headerHeight - settings.paddingTop - scrollY
@@ -648,7 +655,7 @@ export function createMouse(
     canvasY: number; canvasW: number; canvasH: number } | null =>
   {
     const headerHeight = header.value?.height ?? 0
-    const visualLines = lines.visualLines.value
+    const visualLines = getInteractiveVisualLines()
     const scrollY = scroll.pos.y
     const scrollX = scroll.pos.x
     const worldY = y - headerHeight - settings.paddingTop - scrollY
@@ -697,12 +704,10 @@ export function createMouse(
     const inHeader = y >= 0 && y < headerHeight
     const gutterHit = hitTestGutter(canvas, settings, lines, scroll, gutter, x, y, headerHeight)
     const scrollbarHit = hitTestScrollbar(canvas, scroll, lines, settings, gutter, header, x, y)
-    const belowWidgetHit = findBelowWidgetHit(x, y)
-    const beforeAfterWidgetHit = findBeforeAfterWidgetHit(x, y)
     canvas.el.style.cursor = gutterHit.type === 'collapse'
       ? 'pointer'
-      : (y < 0 || inHeader || gutterHit.type !== null || scrollbarHit.type !== null || belowWidgetHit
-          || beforeAfterWidgetHit || widgetPressed.value || headerPressed.value || scrollbars.isDragging.value)
+      : (y < 0 || inHeader || gutterHit.type !== null || scrollbarHit.type !== null || widgetPressed.value
+          || headerPressed.value || scrollbars.isDragging.value)
           ? 'default'
           : 'text'
   })
@@ -764,7 +769,7 @@ export function createMouse(
     }
 
     untracked(() => {
-      const visualLines = lines.visualLines.value
+      const visualLines = getInteractiveVisualLines()
       const worldX = hit.worldX
       const worldY = hit.worldY
 
@@ -852,6 +857,16 @@ export function createMouse(
       hovered.column = column
 
       if (foundToken && foundLine) {
+        if (settings.performanceMode === 'stress') {
+          if (hoverShowTimeout) {
+            clearTimeout(hoverShowTimeout)
+            hoverShowTimeout = null
+          }
+          currentHoverTokenId = null
+          hovered.hoverToken = null
+          return
+        }
+
         const tokenId = `${foundLine.logicalLine}:${foundToken.logicalTokenIndex}`
 
         if (tokenId !== currentHoverTokenId && !escapePressed && !buttonsDown.value) {
@@ -1178,7 +1193,7 @@ export function createMouse(
       if (selection.isSelecting.value) {
         const codeLines = doc.lines
         if (direction === 'down') {
-          const visualLines = lines.visualLines.value
+          const visualLines = getInteractiveVisualLines()
           const headerHeight = header.value?.height ?? 0
           const canvasHeight = canvas.size.height.value - headerHeight - settings.paddingTop - settings.paddingBottom
           const scrollY = scroll.pos.y
@@ -1240,7 +1255,7 @@ export function createMouse(
           }
         }
         else if (direction === 'up') {
-          const visualLines = lines.visualLines.value
+          const visualLines = getInteractiveVisualLines()
           const scrollY = scroll.pos.y
           const scrollX = scroll.pos.x
 

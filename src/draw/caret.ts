@@ -16,6 +16,20 @@ type CaretLayout = {
   screenY: number
 }
 
+type CaretCallBlockAnalysis = {
+  revision: number
+  tokenVersion: number
+  line: number
+  tokenIndex: number
+  token: Token
+  callBlock: Token[]
+  parameterIndex: number
+  parameterStartToken: Token | null
+  functionToken: Token | null
+}
+
+const caretCallBlockAnalysisByContext = new WeakMap<Context, CaretCallBlockAnalysis>()
+
 function createSyntheticCaretLine(currentLine: number, y: number, lineHeight: number): VisualLine {
   return {
     tokens: [],
@@ -24,6 +38,8 @@ function createSyntheticCaretLine(currentLine: number, y: number, lineHeight: nu
     y,
     width: 0,
     height: lineHeight,
+    aboveHeight: 0,
+    logicalAboveHeight: 0,
     widgets: {
       above: [],
       below: [],
@@ -41,11 +57,13 @@ function resolveCaretVisualLine(context: Context, currentLine: number, currentCo
   let foundLine = findVisualLineForColumn(lines, currentLine, currentColumn, tokenLines, caches)
   if (foundLine) return foundLine
 
-  const relevantLines = lines.visualLinesByLogicalLine.value.get(currentLine) ?? []
+  const relevantLines = lines.visualLinesByLogicalLine.value[currentLine] ?? []
   if (relevantLines.length > 0) return relevantLines[0]
 
-  const visualLines = lines.visualLines.value
-  const lastVisualLine = visualLines[visualLines.length - 1]
+  const getLastVisualLine = typeof lines.getLastVisualLine === 'function'
+    ? lines.getLastVisualLine.bind(lines)
+    : () => lines.visualLines.value.at(-1) ?? null
+  const lastVisualLine = getLastVisualLine()
   if (lastVisualLine && currentLine === lastVisualLine.logicalLine + 1) {
     return createSyntheticCaretLine(currentLine, lastVisualLine.y + lastVisualLine.height, settings.lineHeight)
   }
@@ -150,6 +168,59 @@ function findCallBlockTokenPositionFromAnchor(
   return moveTokenPosition(tokenLines, anchorLine, anchorTokenIndex, targetBlockIndex - anchorBlockIndex)
 }
 
+function resolveCaretCallBlockAnalysis(
+  context: Context,
+  tokenLines: Token[][],
+  line: number,
+  tokenIndex: number,
+  token: Token,
+): CaretCallBlockAnalysis {
+  const revision = context.doc.revision
+  const tokenVersion = context.doc.tokenVersion
+  const cached = caretCallBlockAnalysisByContext.get(context)
+  if (
+    cached
+    && cached.revision === revision
+    && cached.tokenVersion === tokenVersion
+    && cached.line === line
+    && cached.tokenIndex === tokenIndex
+    && cached.token === token
+  ) {
+    return cached
+  }
+
+  const callBlock = findCallBlockForToken(tokenLines, line, tokenIndex)
+  const parameterIndex = callBlock.length > 0
+    ? getParameterIndex(callBlock, tokenLines, line, tokenIndex)
+    : -1
+  const parameterStartToken = parameterIndex >= 0 ? getParameterStartToken(callBlock, parameterIndex) : null
+  let functionToken: Token | null = null
+  for (let i = 0; i < callBlock.length; i++) {
+    const blockToken = callBlock[i]
+    if (blockToken.text === '(' && i > 0) {
+      const prevToken = callBlock[i - 1]
+      if (prevToken && (prevToken.type === 'function' || prevToken.type === 'identifier')) {
+        functionToken = prevToken
+        break
+      }
+    }
+  }
+
+  const analysis: CaretCallBlockAnalysis = {
+    revision,
+    tokenVersion,
+    line,
+    tokenIndex,
+    token,
+    callBlock,
+    parameterIndex,
+    parameterStartToken,
+    functionToken,
+  }
+  caretCallBlockAnalysisByContext.set(context, analysis)
+  return analysis
+}
+
 export function drawCaret(context: Context) {
   const { canvas, doc, lines, caret, settings, caches } = context
   const { c } = canvas
@@ -161,10 +232,9 @@ export function drawCaret(context: Context) {
     caret.screenPosition = null
     return
   }
-  if (context.mouse.buttonsDown.value) {
+  const isSelectingWithMouse = context.mouse.buttonsDown.value
+  if (isSelectingWithMouse) {
     caret.caretToken = null
-    caret.screenPosition = null
-    return
   }
 
   const opacity = caret.updateBlink()
@@ -202,11 +272,10 @@ export function drawCaret(context: Context) {
     const finalToken = tokenIndex >= 0 && tokenIndex < logicalLineTokens.length ? logicalLineTokens[tokenIndex] : null
 
     if (finalToken && finalTokenIndex >= 0 && finalTokenIndex < logicalLineTokens.length) {
-      if (caret.isTyping.value) {
-        const callBlock = findCallBlockForToken(tokenLines, currentLine, finalTokenIndex)
-        const parameterIndex = callBlock.length > 0
-          ? getParameterIndex(callBlock, tokenLines, currentLine, finalTokenIndex)
-          : -1
+      if (!isSelectingWithMouse && caret.isTyping.value && context.onCaretToken) {
+        const analysis = resolveCaretCallBlockAnalysis(context, tokenLines, currentLine, finalTokenIndex, finalToken)
+        const callBlock = analysis.callBlock
+        const parameterIndex = analysis.parameterIndex
 
         let tokenX = x
         for (const visualToken of foundLine.tokens) {
@@ -218,7 +287,7 @@ export function drawCaret(context: Context) {
 
         let { x: screenX, y: screenY } = toScreenPosition(context, tokenX, contentY)
         if (parameterIndex >= 0) {
-          const paramStartToken = getParameterStartToken(callBlock, parameterIndex)
+          const paramStartToken = analysis.parameterStartToken
           if (paramStartToken) {
             const pos = findCallBlockTokenPositionFromAnchor(tokenLines, callBlock, currentLine, finalTokenIndex,
               finalToken, paramStartToken)
@@ -241,36 +310,24 @@ export function drawCaret(context: Context) {
 
         let callBlockX = screenX
         let callBlockY = screenY
-        if (callBlock.length > 0) {
-          let functionToken: Token | null = null
-          for (let i = 0; i < callBlock.length; i++) {
-            const token = callBlock[i]
-            if (token.text === '(' && i > 0) {
-              const prevToken = callBlock[i - 1]
-              if (prevToken && (prevToken.type === 'function' || prevToken.type === 'identifier')) {
-                functionToken = prevToken
-                break
-              }
-            }
-          }
-          if (functionToken) {
-            const functionPos = findCallBlockTokenPositionFromAnchor(tokenLines, callBlock, currentLine, finalTokenIndex,
-              finalToken, functionToken)
-            if (functionPos) {
-              const functionLineTokens = tokenLines[functionPos.lineIndex] || []
-              const functionColumn = getColumnForTokenIndex(functionLineTokens, functionPos.tokenIndex)
-              const functionLine = findVisualLineForColumn(lines, functionPos.lineIndex, functionColumn, tokenLines,
+        const functionToken = analysis.functionToken
+        if (callBlock.length > 0 && functionToken) {
+          const functionPos = findCallBlockTokenPositionFromAnchor(tokenLines, callBlock, currentLine, finalTokenIndex,
+            finalToken, functionToken)
+          if (functionPos) {
+            const functionLineTokens = tokenLines[functionPos.lineIndex] || []
+            const functionColumn = getColumnForTokenIndex(functionLineTokens, functionPos.tokenIndex)
+            const functionLine = findVisualLineForColumn(lines, functionPos.lineIndex, functionColumn, tokenLines,
+              caches)
+            if (functionLine) {
+              const functionX = getXFromColumn(lines, functionLine, functionColumn, tokenLines, canvas, settings,
                 caches)
-              if (functionLine) {
-                const functionX = getXFromColumn(lines, functionLine, functionColumn, tokenLines, canvas, settings,
-                  caches)
-                const functionContentY = functionLine.tokenOffset === 0
-                  ? functionLine.y
-                  : functionLine.y + calculateAboveHeightForLine(context, functionLine)
-                const functionScreen = toScreenPosition(context, functionX, functionContentY)
-                callBlockX = functionScreen.x
-                callBlockY = functionScreen.y
-              }
+              const functionContentY = functionLine.tokenOffset === 0
+                ? functionLine.y
+                : functionLine.y + calculateAboveHeightForLine(context, functionLine)
+              const functionScreen = toScreenPosition(context, functionX, functionContentY)
+              callBlockX = functionScreen.x
+              callBlockY = functionScreen.y
             }
           }
         }
