@@ -3,6 +3,9 @@ import type { VisualToken } from './lines.ts'
 import type { Settings } from './settings.ts'
 import type { Token } from './token.ts'
 
+const fontMetricsCache = new Map<string, { height: number; fontHeight: number }>()
+const MAX_FONT_METRICS_CACHE_ENTRIES = 256
+
 export function measureText(
   c: CanvasRenderingContext2D,
   settings: Settings,
@@ -17,26 +20,34 @@ export function measureText(
     fontFamilyName,
     theme: { [type]: { style, weight } },
   } = settings
+  const font = `${weight === 'bold' ? 700 : 400} ${style} ${fontSize} '${fontFamilyName}', monospace`
 
-  const cacheKey = `${text}${style}${weight}${fontSize}${fontFamilyName}`
+  const cacheKey = `${text}\u0000${font}`
   if (measureTextCache.has(cacheKey)) {
     return measureTextCache.get(cacheKey)!
   }
 
-  c.save()
-
-  c.font = `${weight === 'bold' ? 700 : 400} ${style} ${fontSize} '${fontFamilyName}', monospace`
-
+  const prevFont = c.font
+  if (prevFont !== font) c.font = font
   const width = c.measureText(text).width
+  let metrics = fontMetricsCache.get(font)
+  if (!metrics) {
+    const heightMetrics = c.measureText('Mg')
+    metrics = {
+      height: Math.ceil(heightMetrics.actualBoundingBoxAscent + heightMetrics.actualBoundingBoxDescent),
+      fontHeight: Math.ceil(heightMetrics.fontBoundingBoxAscent + heightMetrics.fontBoundingBoxDescent),
+    }
+    if (!fontMetricsCache.has(font) && fontMetricsCache.size >= MAX_FONT_METRICS_CACHE_ENTRIES) {
+      const oldestKey = fontMetricsCache.keys().next().value
+      if (typeof oldestKey === 'string') fontMetricsCache.delete(oldestKey)
+    }
+    fontMetricsCache.set(font, metrics)
+  }
+  if (prevFont !== font) c.font = prevFont
 
-  const heightMetrics = c.measureText('Mg')
-  const height = Math.ceil(heightMetrics.actualBoundingBoxAscent + heightMetrics.actualBoundingBoxDescent)
-  const fontHeight = Math.ceil(heightMetrics.fontBoundingBoxAscent + heightMetrics.fontBoundingBoxDescent)
-
-  c.restore()
-
-  measureTextCache.set(cacheKey, { width, height, fontHeight })
-  return { width, height, fontHeight }
+  const measured = { width, height: metrics.height, fontHeight: metrics.fontHeight }
+  measureTextCache.set(cacheKey, measured)
+  return measured
 }
 
 export function measureLine(
