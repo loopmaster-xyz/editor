@@ -10,6 +10,7 @@ export function createCaret(settings: Settings) {
   const column = signal(0)
   const columnIntent = signal(0)
   const isTyping = signal(false)
+  const isWindowFocused = signal(true)
   const lastInputTime = signal(0)
 
   let startTime = Date.now()
@@ -31,6 +32,10 @@ export function createCaret(settings: Settings) {
   }
 
   const updateBlink = () => {
+    if (!isWindowFocused.value) {
+      return 0
+    }
+
     const now = Date.now()
     const elapsed = now - startTime
     const delay = 500 * settings.caretPhaseCoeff
@@ -50,15 +55,25 @@ export function createCaret(settings: Settings) {
     resetBlink()
   }
 
+  const setWindowFocus = (focused: boolean) => {
+    if (isWindowFocused.value === focused) return
+    isWindowFocused.value = focused
+    if (focused) {
+      resetBlink()
+    }
+  }
+
   return {
     line,
     column,
     columnIntent,
     isTyping,
+    isWindowFocused,
     lastInputTime,
     resetBlink,
     updateBlink,
     setPosition,
+    setWindowFocus,
     get suppressAutoScroll() {
       return suppressAutoScroll
     },

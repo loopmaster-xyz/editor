@@ -15,7 +15,24 @@ type PerfStats = {
   lastSampledInputTime: number
 }
 
+type ViewportMetrics = {
+  top: number
+  left: number
+  width: number
+  height: number
+}
+
 const perfStatsByContext = new WeakMap<Context, PerfStats>()
+
+function readViewportMetrics(): ViewportMetrics {
+  const viewport = window.visualViewport
+  return {
+    top: viewport?.offsetTop ?? 0,
+    left: viewport?.offsetLeft ?? 0,
+    width: viewport?.width ?? window.innerWidth,
+    height: viewport?.height ?? window.innerHeight,
+  }
+}
 
 function updatePerformanceMode(context: Context, drawMs: number) {
   let stats = perfStatsByContext.get(context)
@@ -47,7 +64,7 @@ function updatePerformanceMode(context: Context, drawMs: number) {
 }
 
 function drawContext(context: Context, overlayCanvas: ReturnType<typeof createOverlayCanvas>,
-  activeTooltip: Map<Context, 'hover' | 'caret' | null>)
+  activeTooltip: Map<Context, 'hover' | 'caret' | null>, viewport: ViewportMetrics)
 {
   const drawStart = performance.now()
   const { canvas } = context
@@ -56,13 +73,8 @@ function drawContext(context: Context, overlayCanvas: ReturnType<typeof createOv
   context.scroll.update()
 
   const rect = canvas.rect
-  const viewport = window.visualViewport
-  const viewportTop = viewport?.offsetTop ?? 0
-  const viewportLeft = viewport?.offsetLeft ?? 0
-  const viewportHeight = viewport?.height ?? window.innerHeight
-  const viewportWidth = viewport?.width ?? window.innerWidth
-  const inViewport = rect.bottom > viewportTop && rect.top < viewportTop + viewportHeight && rect.right > viewportLeft
-    && rect.left < viewportLeft + viewportWidth
+  const inViewport = rect.bottom > viewport.top && rect.top < viewport.top + viewport.height
+    && rect.right > viewport.left && rect.left < viewport.left + viewport.width
   if (!inViewport) {
     return
   }
@@ -182,6 +194,19 @@ class RenderManager {
   private contexts = new Set<Context>()
   private overlayCanvas = createOverlayCanvas()
   private activeTooltip = new Map<Context, 'hover' | 'caret' | null>()
+  private viewport = readViewportMetrics()
+  private viewportDirty = true
+
+  constructor() {
+    const markViewportDirty = () => {
+      this.viewportDirty = true
+    }
+
+    window.addEventListener('resize', markViewportDirty, { passive: true })
+    window.addEventListener('scroll', markViewportDirty, { passive: true, capture: true })
+    window.visualViewport?.addEventListener('resize', markViewportDirty, { passive: true })
+    window.visualViewport?.addEventListener('scroll', markViewportDirty, { passive: true })
+  }
 
   register(context: Context) {
     this.contexts.add(context)
@@ -193,9 +218,14 @@ class RenderManager {
   }
 
   draw() {
+    if (this.viewportDirty) {
+      this.viewport = readViewportMetrics()
+      this.viewportDirty = false
+    }
     this.overlayCanvas.clear()
+
     for (const context of this.contexts) {
-      drawContext(context, this.overlayCanvas, this.activeTooltip)
+      drawContext(context, this.overlayCanvas, this.activeTooltip, this.viewport)
     }
   }
 }

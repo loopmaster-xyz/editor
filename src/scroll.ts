@@ -26,18 +26,20 @@ export function createScroll(canvas: Canvas, lines: Lines, settings: Settings, g
 
   const update = () => {
     batch(() => {
-      if (pos.x === Infinity || pos.y === Infinity) {
-        if (targetX.value === Infinity || targetY.value === Infinity) {
+      const { x, y } = pos
+      if (x === Infinity) {
+        if (targetX.value === Infinity) {
           return
         }
         pos.x = targetX.value
         pos.y = targetY.value
         return
       }
-      const dx = targetX.value - pos.x
-      const dy = targetY.value - pos.y
-      pos.x = pos.x + dx * smooth.value
-      pos.y = pos.y + dy * smooth.value
+      const dx = targetX.value - x
+      const dy = targetY.value - y
+      const s = smooth.value
+      pos.x = x + dx * s
+      pos.y = y + dy * s
       if (Math.abs(dx) < SCROLL_SMOOTH_THRESHOLD && Math.abs(dy) < SCROLL_SMOOTH_THRESHOLD) {
         pos.x = targetX.value
         pos.y = targetY.value

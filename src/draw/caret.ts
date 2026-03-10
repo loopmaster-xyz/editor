@@ -226,7 +226,10 @@ export function drawCaret(context: Context) {
   const { c } = canvas
 
   const activeCanvas = getActiveCanvas()
-  const isFocused = activeCanvas === canvas.el
+  const isCanvasFocused = activeCanvas === canvas.el
+  const isWindowFocused = typeof document === 'undefined' ? true : document.hasFocus()
+  const isFocused = isCanvasFocused && isWindowFocused
+  caret.setWindowFocus(isWindowFocused)
   if (!isFocused) {
     caret.caretToken = null
     caret.screenPosition = null
