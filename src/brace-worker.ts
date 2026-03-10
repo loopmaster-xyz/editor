@@ -194,7 +194,7 @@ function buildBraceCache(tokenLines: Token[][]): BraceCache {
               })
             }
           }
-          else if (openingBraces.has(char) || closingBraces.has(char)) {
+          else if (inString === null && (openingBraces.has(char) || closingBraces.has(char))) {
             braces.push({
               char,
               line: lineIndex,

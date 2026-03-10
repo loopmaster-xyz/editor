@@ -253,7 +253,7 @@ function getSameLineBraceDepthForPosition(
           continue
         }
 
-        if (openingBraces.has(char) || closingBraces.has(char)) {
+        if (inString === null && (openingBraces.has(char) || closingBraces.has(char))) {
           braces.push({ char, tokenIndex: i, charIndex: j, isOpening: openingBraces.has(char) })
         }
       }
@@ -297,6 +297,7 @@ function findSameLineMatchingBraceFallback(
 
   const stack: SameLineBrace[] = []
   const pairs: Array<{ open: SameLineBrace; close: SameLineBrace }> = []
+  let inString: string | null = null
 
   let position = 0
   for (let tokenIndex = 0; tokenIndex < lineTokens.length; tokenIndex++) {
@@ -308,8 +309,32 @@ function findSameLineMatchingBraceFallback(
       continue
     }
 
+    let escaped = false
     for (let charIndex = 0; charIndex < text.length; charIndex++) {
       const char = text[charIndex]
+      if (escaped) {
+        escaped = false
+        continue
+      }
+      if (char === '\\') {
+        escaped = true
+        continue
+      }
+
+      if (quoteChars.has(char)) {
+        if (inString === null) {
+          inString = char
+        }
+        else if (inString === char) {
+          inString = null
+        }
+        continue
+      }
+
+      if (inString !== null) {
+        continue
+      }
+
       if (openingBraces.has(char)) {
         stack.push({
           char,
@@ -433,7 +458,7 @@ function buildBraceCache(tokenLines: Token[][], tokenVersion: number): BraceCach
               })
             }
           }
-          else if (openingBraces.has(char) || closingBraces.has(char)) {
+          else if (inString === null && (openingBraces.has(char) || closingBraces.has(char))) {
             braces.push({
               char,
               line: lineIndex,
