@@ -3,7 +3,7 @@ import { getCharOffsetForVisualLine, getXFromColumnUnclamped, isLineEmpty } from
 import type { VisualLine } from '../lines.ts'
 import { measureText } from '../measure.ts'
 import type { Widget } from '../widget.ts'
-import { VERTICAL_SCROLLBAR_SIZE } from './scrollbar.ts'
+import { getVerticalScrollbarSize } from './scrollbar.ts'
 
 const hasAboveWidgetStartCache = new WeakMap<VisualLine[], boolean>()
 const nextAboveWidgetStartIndexCache = new WeakMap<VisualLine[], number[]>()
@@ -195,13 +195,14 @@ export function drawFullWidgets(
   if (emptyHeight === 0) return
 
   const headerHeight = context.header.value?.height ?? 0
+  const verticalScrollbarSize = getVerticalScrollbarSize(context.settings)
   const needsVertical = context.lines.totalHeight.value > context.canvas.size.height.value - headerHeight
       - context.settings.paddingTop - context.settings.paddingBottom
   const widgetY = line.y - emptyHeight
   const x = -context.scroll.pos.x
   const contentLeft = context.gutter.width.value + context.settings.paddingLeft
   const w = context.canvas.size.width.value - context.gutter.width.value
-    - (needsVertical ? VERTICAL_SCROLLBAR_SIZE : 0)
+    - (needsVertical ? verticalScrollbarSize : 0)
   const fw = context.canvas.size.width.value
 
   for (const widget of fullWidgets) {

@@ -1,4 +1,5 @@
 import { computed, effect, signal } from '@preact/signals-core'
+import braceWorkerUrl from './brace-worker.ts?worker&url'
 import type { Caches } from './caches.ts'
 import type { Doc } from './doc.ts'
 import type { Token } from './token.ts'
@@ -62,7 +63,7 @@ interface LineTransform {
 
 const openingBraces = new Set(['{', '(', '['])
 const closingBraces = new Set(['}', ')', ']'])
-const quoteChars = new Set(["'", '"', '`'])
+const quoteChars = new Set(['\'', '"', '`'])
 
 type VersionedBraceCacheEntry = {
   tokenVersion: number
@@ -177,8 +178,8 @@ function getMatchingOpenBrace(closeChar: string): string {
       return '('
     case ']':
       return '['
-    case "'":
-      return "'"
+    case '\'':
+      return '\''
     case '"':
       return '"'
     case '`':
@@ -1000,7 +1001,7 @@ export function createBlocks(doc: Doc, caches: Caches) {
   const ensureBraceWorker = () => {
     if (!shouldUseBraceWorker()) return null
     if (braceWorker) return braceWorker
-    braceWorker = new Worker(new URL('./brace-worker.ts', import.meta.url), { type: 'module' })
+    braceWorker = new Worker(braceWorkerUrl, { type: 'module' })
     braceWorker.onmessage = (event: MessageEvent<BraceCacheRebuildResultMessage>) => {
       const message = event.data
       if (!message || message.type !== 'braceCacheRebuildResult') return
@@ -1371,7 +1372,8 @@ export function createBlocks(doc: Doc, caches: Caches) {
       const openBrace = braces[pair.openIndex]
       const closeBrace = braces[pair.closeIndex]
       depthByLocation.set(makeBraceLocationKey(openBrace.line, openBrace.tokenIndex, openBrace.charIndex), pair.depth)
-      depthByLocation.set(makeBraceLocationKey(closeBrace.line, closeBrace.tokenIndex, closeBrace.charIndex), pair.depth)
+      depthByLocation.set(makeBraceLocationKey(closeBrace.line, closeBrace.tokenIndex, closeBrace.charIndex),
+        pair.depth)
     }
 
     return depthByLocation

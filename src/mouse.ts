@@ -423,7 +423,7 @@ export function findCallBlockForToken(tokenLines: Token[][], lineIndex: number, 
 
     currentLineIndex--
     if (currentLineIndex >= 0 && currentLineIndex < tokenLines.length) {
-      currentTokenIndex = tokenLines[currentLineIndex].length - 1
+      currentTokenIndex = (tokenLines[currentLineIndex]?.length ?? 0) - 1
     }
     else {
       currentTokenIndex = -1

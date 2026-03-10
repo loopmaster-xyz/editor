@@ -3,7 +3,7 @@ import type { Blocks } from './blocks.ts'
 import { type Caches, getWrapTokensCacheKey } from './caches.ts'
 import type { Canvas } from './canvas.ts'
 import type { Doc, DocError, DocIncrementalChange } from './doc.ts'
-import { VERTICAL_SCROLLBAR_SIZE } from './draw/scrollbar.ts'
+import { getVerticalScrollbarSize } from './draw/scrollbar.ts'
 import type { Header } from './header.ts'
 import { FenwickTree } from './lib/fenwick.ts'
 import { getCharOffsetForVisualLine, isLineEmpty } from './line-utils.ts'
@@ -807,8 +807,9 @@ export function createLines(
     const errorsRef = doc.errors
     const baseAvailableWidth = canvas.size.width.value - settings.paddingLeft - settings.paddingRight
       - metrics.gutterWidth.value
+    const verticalScrollbarSize = getVerticalScrollbarSize(settings)
     const maxWidth = settings.wordWrap
-      ? baseAvailableWidth - VERTICAL_SCROLLBAR_SIZE
+      ? baseAvailableWidth - verticalScrollbarSize
       : Infinity
 
     if (widgetsRef !== cachedWidgetsRef) {
@@ -1015,7 +1016,7 @@ export function createLines(
 
       const nextTotalHeight = nextHeightIndex.total()
       const nextTotalWidth = settings.wordWrap
-        ? Math.min(maxLineWidth, baseAvailableWidth - VERTICAL_SCROLLBAR_SIZE)
+        ? Math.min(maxLineWidth, baseAvailableWidth - verticalScrollbarSize)
         : maxLineWidth
 
       let outputVisualLines: VisualLine[] = []
@@ -1177,7 +1178,7 @@ export function createLines(
     }
 
     const nextTotalWidth = settings.wordWrap
-      ? Math.min(maxLineWidth, baseAvailableWidth - VERTICAL_SCROLLBAR_SIZE)
+      ? Math.min(maxLineWidth, baseAvailableWidth - verticalScrollbarSize)
       : maxLineWidth
 
     let processedLines: VisualLine[] = []

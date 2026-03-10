@@ -100,6 +100,7 @@ const defaultSettings = {
   blockComment: ['/*', '*/'] as [string, string],
   minGutterDigits: 2,
   showGutter: true,
+  showMinimap: false,
   performanceMode: 'normal' as 'normal' | 'large' | 'stress',
 }
 

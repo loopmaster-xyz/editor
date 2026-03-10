@@ -70,25 +70,60 @@ function getSyncTokenizationBudget(lineCount: number): number {
 }
 
 const LEGACY_DEFERRED_TOKENIZE_DELAY_MS = 75
+const BURST_DEFERRED_TOKENIZE_DELAY_MS = 40
+const UNRESOLVED_SCAN_BUDGET_LINES = 4096
+
+function createFallbackTokenLine(line: string): Token[] {
+  if (line.length === 0) return []
+  return [{ type: 'text', text: line }]
+}
+
+function tokensMatchLine(tokens: Token[] | undefined, line: string): boolean {
+  if (!tokens) return false
+  if (line.length === 0) return tokens.length === 0
+
+  let offset = 0
+  for (let i = 0; i < tokens.length; i++) {
+    const text = tokens[i]?.text ?? ''
+    if (!line.startsWith(text, offset)) return false
+    offset += text.length
+  }
+  return offset === line.length
+}
+
+function tokensEqual(a: Token[] | undefined, b: Token[]): boolean {
+  if (!a) return false
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) {
+    const tokenA = a[i]
+    const tokenB = b[i]
+    if (!tokenA || !tokenB) return false
+    if (tokenA.type !== tokenB.type || tokenA.text !== tokenB.text) return false
+  }
+  return true
+}
 
 function alignTokenSnapshotsForSpliceInPlace(
   tokenLines: Token[][],
   tokenStates: unknown[],
-  nextLineCount: number,
+  nextLines: string[],
+  startLine: number,
   endLineBefore: number,
   endLineAfter: number,
 ): boolean {
+  const nextLineCount = nextLines.length
   const delta = endLineAfter - endLineBefore
-  if (delta === 0 && tokenLines.length === nextLineCount && tokenStates.length === nextLineCount) {
-    return false
-  }
   let changed = false
 
   if (delta > 0) {
     const insertCount = delta
     const insertAt = Math.max(0, Math.min(endLineBefore + 1, tokenLines.length))
-    const tokenLinePlaceholders = new Array(insertCount) as Token[][]
+    const tokenLinePlaceholders = new Array<Token[]>(insertCount)
     const tokenStatePlaceholders = new Array(insertCount) as unknown[]
+    for (let i = 0; i < insertCount; i++) {
+      tokenLinePlaceholders[i] = createFallbackTokenLine(nextLines[insertAt + i] ?? '')
+      tokenStatePlaceholders[i] = undefined
+    }
     tokenLines.splice(insertAt, 0, ...tokenLinePlaceholders)
     tokenStates.splice(insertAt, 0, ...tokenStatePlaceholders)
     changed = true
@@ -108,7 +143,11 @@ function alignTokenSnapshotsForSpliceInPlace(
     changed = true
   }
   if (tokenLines.length < nextLineCount) {
+    const previousLength = tokenLines.length
     tokenLines.length = nextLineCount
+    for (let i = previousLength; i < nextLineCount; i++) {
+      tokenLines[i] = createFallbackTokenLine(nextLines[i] ?? '')
+    }
     changed = true
   }
 
@@ -117,8 +156,32 @@ function alignTokenSnapshotsForSpliceInPlace(
     changed = true
   }
   if (tokenStates.length < nextLineCount) {
+    const previousLength = tokenStates.length
     tokenStates.length = nextLineCount
+    for (let i = previousLength; i < nextLineCount; i++) {
+      tokenStates[i] = undefined
+    }
     changed = true
+  }
+
+  if (nextLineCount === 0) return changed
+
+  const alignedStartLine = Math.max(0, Math.min(startLine, nextLineCount - 1))
+  const alignedEndLine = Math.max(
+    alignedStartLine,
+    Math.min(Math.max(endLineAfter, startLine), nextLineCount - 1),
+  )
+  for (let line = alignedStartLine; line <= alignedEndLine; line++) {
+    const nextLineText = nextLines[line] ?? ''
+    const tokenLine = tokenLines[line]
+    if (!tokensMatchLine(tokenLine, nextLineText)) {
+      tokenLines[line] = createFallbackTokenLine(nextLineText)
+      changed = true
+    }
+    if (tokenStates[line] !== undefined) {
+      tokenStates[line] = undefined
+      changed = true
+    }
   }
 
   return changed
@@ -133,6 +196,13 @@ export function createDoc(tokenize: Tokenizer = defaultIncrementalTokenizer) {
   let tokenizerWorker: Worker | null = null
   let workerJobId = 0
   let activeWorkerJob: { jobId: number; startLine: number; endLine: number; revision: number } | null = null
+  let firstUnresolvedTokenLine = -1
+  let lastOptimisticViewportPass: {
+    revision: number
+    tokenVersion: number
+    startLine: number
+    endLine: number
+  } | null = null
 
   const doc = signalify({
     epoch: 0,
@@ -168,6 +238,95 @@ export function createDoc(tokenize: Tokenizer = defaultIncrementalTokenizer) {
     get lines(): string[] {
       return buffer.lines.value
     },
+    optimisticallyTokenizeViewport(startLine: number, endLine: number) {
+      if (!isIncrementalTokenizer(doc.tokenize)) return false
+
+      const lines = buffer.lines.value
+      if (lines.length === 0) return false
+
+      let clampedStartLine = Math.max(0, Math.min(startLine, lines.length - 1))
+      let clampedEndLine = Math.max(0, Math.min(endLine, lines.length - 1))
+      if (clampedEndLine < clampedStartLine) {
+        const swap = clampedStartLine
+        clampedStartLine = clampedEndLine
+        clampedEndLine = swap
+      }
+
+      if (
+        lastOptimisticViewportPass
+        && lastOptimisticViewportPass.revision === doc.revision
+        && lastOptimisticViewportPass.tokenVersion === doc.tokenVersion
+        && lastOptimisticViewportPass.startLine <= clampedStartLine
+        && lastOptimisticViewportPass.endLine >= clampedEndLine
+      ) {
+        return false
+      }
+
+      const processedStartLine = clampedStartLine
+      const processedEndLine = clampedEndLine
+      let tokenVisualChanged = false
+      let hadUnresolvedState = false
+      let prevState: unknown = null
+      if (clampedStartLine > 0) {
+        const stateBeforeRange = doc.tokenStates[clampedStartLine - 1]
+        prevState = stateBeforeRange === undefined ? null : (stateBeforeRange ?? null)
+      }
+
+      for (let line = clampedStartLine; line <= clampedEndLine; line++) {
+        if (doc.tokenStates[line] === undefined) hadUnresolvedState = true
+        const result = doc.tokenize.tokenizeLine(lines[line] ?? '', line, prevState)
+        if (!tokensEqual(doc.tokenLines[line], result.tokens)) {
+          doc.tokenLines[line] = result.tokens
+          tokenVisualChanged = true
+        }
+        prevState = result.state ?? null
+      }
+
+      if (hadUnresolvedState) {
+        markUnresolvedFromLine(processedStartLine, lines)
+      }
+
+      const fullEndLine = Math.max(0, lines.length - 1)
+      const needsCanonicalPass = tokenVisualChanged || hadUnresolvedState
+      if (needsCanonicalPass) {
+        if (pendingDeferredRange) {
+          pendingDeferredRange.startLine = Math.min(pendingDeferredRange.startLine, processedStartLine)
+          pendingDeferredRange.endLine = Math.max(pendingDeferredRange.endLine, fullEndLine)
+        }
+        else {
+          pendingDeferredRange = {
+            startLine: processedStartLine,
+            endLine: fullEndLine,
+          }
+        }
+        doc.tokenizationPending = true
+      }
+
+      if (tokenVisualChanged) {
+        bumpTokenVersion()
+        emitIncrementalChange({
+          source: 'sync',
+          startLine: processedStartLine,
+          endLineBefore: processedEndLine,
+          endLineAfter: processedEndLine,
+          tokenProcessedStartLine: processedStartLine,
+          tokenProcessedEndLine: processedEndLine,
+          tokenConverged: false,
+        })
+      }
+
+      lastOptimisticViewportPass = {
+        revision: doc.revision,
+        tokenVersion: doc.tokenVersion,
+        startLine: clampedStartLine,
+        endLine: clampedEndLine,
+      }
+
+      if (needsCanonicalPass) {
+        queueDeferredTokenization()
+      }
+      return tokenVisualChanged
+    },
     replace(index: number, length: number, text: string) {
       buffer.replace(index, length, text)
     },
@@ -182,6 +341,64 @@ export function createDoc(tokenize: Tokenizer = defaultIncrementalTokenizer) {
 
   const bumpTokenVersion = () => {
     doc.tokenVersion++
+  }
+
+  const findNextUnresolvedTokenLine = (fromLine: number, lines: string[]) => {
+    const startLine = Math.max(0, fromLine)
+    const scanLimit = Math.min(lines.length, startLine + UNRESOLVED_SCAN_BUDGET_LINES)
+    for (let line = startLine; line < scanLimit; line++) {
+      if (doc.tokenLines[line] === undefined || doc.tokenStates[line] === undefined) return line
+    }
+    return scanLimit >= lines.length ? -1 : scanLimit
+  }
+
+  const markUnresolvedFromLine = (line: number, lines: string[]) => {
+    if (lines.length === 0) {
+      firstUnresolvedTokenLine = -1
+      return
+    }
+    const clamped = Math.max(0, Math.min(line, lines.length - 1))
+    if (firstUnresolvedTokenLine === -1 || clamped < firstUnresolvedTokenLine) {
+      firstUnresolvedTokenLine = clamped
+    }
+  }
+
+  const shiftUnresolvedLineForSplice = (
+    startLine: number,
+    endLineBefore: number,
+    endLineAfter: number,
+    lineCount: number,
+  ) => {
+    if (firstUnresolvedTokenLine < 0) return
+    const delta = endLineAfter - endLineBefore
+    if (delta === 0) return
+
+    if (firstUnresolvedTokenLine > endLineBefore) {
+      firstUnresolvedTokenLine += delta
+    }
+    else if (firstUnresolvedTokenLine >= startLine) {
+      firstUnresolvedTokenLine = startLine
+    }
+
+    if (lineCount <= 0) {
+      firstUnresolvedTokenLine = -1
+      return
+    }
+    if (firstUnresolvedTokenLine < 0) firstUnresolvedTokenLine = 0
+    if (firstUnresolvedTokenLine >= lineCount) firstUnresolvedTokenLine = lineCount - 1
+  }
+
+  const refreshFirstUnresolvedTokenLine = (
+    processedEndLine: number,
+    lines: string[],
+  ) => {
+    if (firstUnresolvedTokenLine >= lines.length) {
+      firstUnresolvedTokenLine = -1
+    }
+    if (firstUnresolvedTokenLine >= 0 && processedEndLine >= firstUnresolvedTokenLine) {
+      firstUnresolvedTokenLine = findNextUnresolvedTokenLine(firstUnresolvedTokenLine, lines)
+    }
+    return firstUnresolvedTokenLine
   }
 
   const shouldUseTokenizerWorker = () => {
@@ -213,6 +430,7 @@ export function createDoc(tokenize: Tokenizer = defaultIncrementalTokenizer) {
 
       const nextTokenLines = doc.tokenLines
       const nextTokenStates = doc.tokenStates
+      const lines = buffer.lines.value
       let changed = false
       for (let i = 0; i < message.tokenLines.length; i++) {
         const line = message.startLine + i
@@ -229,6 +447,28 @@ export function createDoc(tokenize: Tokenizer = defaultIncrementalTokenizer) {
       }
       if (changed) bumpTokenVersion()
 
+      if (pendingDeferredRange) {
+        pendingDeferredRange.startLine = job.endLine + 1
+      }
+
+      const unresolvedStartLine = refreshFirstUnresolvedTokenLine(job.endLine, lines)
+      if (unresolvedStartLine >= 0) {
+        const endLine = Math.max(0, lines.length - 1)
+        if (!pendingDeferredRange) {
+          pendingDeferredRange = {
+            startLine: unresolvedStartLine,
+            endLine,
+          }
+        }
+        else {
+          pendingDeferredRange.startLine = Math.min(pendingDeferredRange.startLine, unresolvedStartLine)
+          pendingDeferredRange.endLine = Math.max(pendingDeferredRange.endLine, endLine)
+        }
+      }
+
+      const converged = (pendingDeferredRange === null || pendingDeferredRange.startLine > pendingDeferredRange.endLine)
+        && unresolvedStartLine < 0
+
       emitIncrementalChange({
         source: 'deferred',
         startLine: job.startLine,
@@ -236,16 +476,13 @@ export function createDoc(tokenize: Tokenizer = defaultIncrementalTokenizer) {
         endLineAfter: job.endLine,
         tokenProcessedStartLine: job.startLine,
         tokenProcessedEndLine: job.endLine,
-        tokenConverged: pendingDeferredRange === null || pendingDeferredRange.startLine > pendingDeferredRange.endLine,
+        tokenConverged: converged,
       })
 
-      if (pendingDeferredRange) {
-        pendingDeferredRange.startLine = job.endLine + 1
-        if (pendingDeferredRange.startLine > pendingDeferredRange.endLine) {
-          pendingDeferredRange = null
-          doc.tokenizationPending = false
-          return
-        }
+      if (converged) {
+        pendingDeferredRange = null
+        doc.tokenizationPending = false
+        return
       }
 
       if (pendingDeferredRange) {
@@ -261,6 +498,16 @@ export function createDoc(tokenize: Tokenizer = defaultIncrementalTokenizer) {
   const queueDeferredTokenization = () => {
     if (!pendingDeferredRange) return
 
+    if (doc.keyHoldActive) {
+      if (deferredTokenizationTimer !== null) return
+      deferredTokenizationTimer = setTimeout(() => {
+        deferredTokenizationTimer = null
+        if (!pendingDeferredRange) return
+        queueDeferredTokenization()
+      }, BURST_DEFERRED_TOKENIZE_DELAY_MS)
+      return
+    }
+
     if (!isIncrementalTokenizer(doc.tokenize)) {
       if (deferredTokenizationTimer !== null) {
         clearTimeout(deferredTokenizationTimer)
@@ -268,11 +515,16 @@ export function createDoc(tokenize: Tokenizer = defaultIncrementalTokenizer) {
       deferredTokenizationTimer = setTimeout(() => {
         deferredTokenizationTimer = null
         if (!pendingDeferredRange) return
+        if (doc.keyHoldActive) {
+          queueDeferredTokenization()
+          return
+        }
 
         const lines = buffer.lines.value
         const tokenLines = doc.tokenize(lines.join('\n'))
         doc.tokenLines = tokenLines
         doc.tokenStates = new Array(tokenLines.length).fill(null)
+        firstUnresolvedTokenLine = -1
         bumpTokenVersion()
         pendingDeferredRange = null
         doc.tokenizationPending = false
@@ -321,6 +573,10 @@ export function createDoc(tokenize: Tokenizer = defaultIncrementalTokenizer) {
     deferredTokenizationTimer = setTimeout(() => {
       deferredTokenizationTimer = null
       if (!pendingDeferredRange) return
+      if (doc.keyHoldActive) {
+        queueDeferredTokenization()
+        return
+      }
 
       const lines = buffer.lines.value
       const startLine = Math.max(0, pendingDeferredRange.startLine)
@@ -341,6 +597,14 @@ export function createDoc(tokenize: Tokenizer = defaultIncrementalTokenizer) {
         Math.max(512, getSyncTokenizationBudget(lines.length) * 8),
       )
       if (tokenized.changed) bumpTokenVersion()
+      const unresolvedStartLine = refreshFirstUnresolvedTokenLine(
+        tokenized.processedEndLine,
+        lines,
+      )
+      const converged = tokenized.converged && unresolvedStartLine < 0
+      const nextDeferredStartLine = unresolvedStartLine >= 0
+        ? Math.min(Math.max(0, tokenized.processedEndLine + 1), unresolvedStartLine)
+        : Math.max(0, tokenized.processedEndLine + 1)
       emitIncrementalChange({
         source: 'deferred',
         startLine,
@@ -348,16 +612,16 @@ export function createDoc(tokenize: Tokenizer = defaultIncrementalTokenizer) {
         endLineAfter: endLine,
         tokenProcessedStartLine: tokenized.processedStartLine,
         tokenProcessedEndLine: tokenized.processedEndLine,
-        tokenConverged: tokenized.converged,
+        tokenConverged: converged,
       })
 
-      if (tokenized.converged) {
+      if (converged) {
         pendingDeferredRange = null
         doc.tokenizationPending = false
         return
       }
 
-      pendingDeferredRange.startLine = tokenized.processedEndLine + 1
+      pendingDeferredRange.startLine = nextDeferredStartLine
       if (pendingDeferredRange.startLine > pendingDeferredRange.endLine) {
         pendingDeferredRange = null
         doc.tokenizationPending = false
@@ -388,6 +652,7 @@ export function createDoc(tokenize: Tokenizer = defaultIncrementalTokenizer) {
       const full = tokenizeAll(doc.tokenize, currentLines)
       doc.tokenLines = full.tokenLines
       doc.tokenStates = full.states
+      firstUnresolvedTokenLine = -1
       bumpTokenVersion()
       doc.tokenizationPending = false
       emitIncrementalChange({
@@ -416,14 +681,33 @@ export function createDoc(tokenize: Tokenizer = defaultIncrementalTokenizer) {
         changed = true
       }
       for (let i = nextTokenLines.length; i < currentLines.length; i++) {
-        nextTokenLines[i] = []
+        nextTokenLines[i] = createFallbackTokenLine(currentLines[i] ?? '')
         changed = true
       }
       for (let i = nextTokenStates.length; i < currentLines.length; i++) {
         nextTokenStates[i] = undefined
         changed = true
       }
+      if (currentLines.length > 0) {
+        const alignedStartLine = Math.max(0, Math.min(startLine, currentLines.length - 1))
+        const alignedEndLine = Math.max(
+          alignedStartLine,
+          Math.min(Math.max(endLineAfter, startLine), currentLines.length - 1),
+        )
+        for (let line = alignedStartLine; line <= alignedEndLine; line++) {
+          const lineText = currentLines[line] ?? ''
+          if (!tokensMatchLine(nextTokenLines[line], lineText)) {
+            nextTokenLines[line] = createFallbackTokenLine(lineText)
+            changed = true
+          }
+          if (nextTokenStates[line] !== undefined) {
+            nextTokenStates[line] = undefined
+            changed = true
+          }
+        }
+      }
       if (changed) bumpTokenVersion()
+      firstUnresolvedTokenLine = currentLines.length > 0 ? 0 : -1
       doc.tokenizationPending = true
 
       emitIncrementalChange({
@@ -444,17 +728,61 @@ export function createDoc(tokenize: Tokenizer = defaultIncrementalTokenizer) {
       return
     }
 
-      const tokenized = tokenizeIncremental(
-        doc.tokenize,
-        currentLines,
-        doc.tokenLines,
-        doc.tokenStates,
-        Math.max(0, startLine),
-        Math.max(endLineBefore, endLineAfter) + 1,
-        maxLines,
-      )
+    if (source === 'sync' && doc.keyHoldActive) {
+      const hasLines = currentLines.length > 0
+      firstUnresolvedTokenLine = currentLines.length > 0
+        ? Math.max(0, Math.min(startLine, currentLines.length - 1))
+        : -1
+      doc.tokenizationPending = hasLines
+      if (prealignedChanged) bumpTokenVersion()
+
+      emitIncrementalChange({
+        source,
+        startLine,
+        endLineBefore,
+        endLineAfter,
+        tokenProcessedStartLine: Math.max(0, startLine),
+        tokenProcessedEndLine: Math.max(0, Math.max(endLineBefore, endLineAfter)),
+        tokenConverged: !hasLines,
+      })
+
+      if (hasLines) {
+        const rangeStart = Math.max(0, Math.min(startLine, currentLines.length - 1))
+        const rangeEnd = Math.max(0, currentLines.length - 1)
+        if (pendingDeferredRange) {
+          pendingDeferredRange.startLine = Math.min(pendingDeferredRange.startLine, rangeStart)
+          pendingDeferredRange.endLine = Math.max(pendingDeferredRange.endLine, rangeEnd)
+        }
+        else {
+          pendingDeferredRange = {
+            startLine: rangeStart,
+            endLine: rangeEnd,
+          }
+        }
+        queueDeferredTokenization()
+      }
+      return
+    }
+
+    const tokenized = tokenizeIncremental(
+      doc.tokenize,
+      currentLines,
+      doc.tokenLines,
+      doc.tokenStates,
+      Math.max(0, startLine),
+      Math.max(endLineBefore, endLineAfter) + 1,
+      maxLines,
+    )
     if (tokenized.changed || prealignedChanged) bumpTokenVersion()
-    doc.tokenizationPending = !tokenized.converged
+    const unresolvedStartLine = refreshFirstUnresolvedTokenLine(
+      tokenized.processedEndLine,
+      currentLines,
+    )
+    const converged = tokenized.converged && unresolvedStartLine < 0
+    const nextDeferredStartLine = unresolvedStartLine >= 0
+      ? Math.min(Math.max(0, tokenized.processedEndLine + 1), unresolvedStartLine)
+      : Math.max(0, tokenized.processedEndLine + 1)
+    doc.tokenizationPending = !converged
 
     emitIncrementalChange({
       source,
@@ -463,12 +791,12 @@ export function createDoc(tokenize: Tokenizer = defaultIncrementalTokenizer) {
       endLineAfter,
       tokenProcessedStartLine: tokenized.processedStartLine,
       tokenProcessedEndLine: tokenized.processedEndLine,
-      tokenConverged: tokenized.converged,
+      tokenConverged: converged,
     })
 
-    if (!tokenized.converged) {
+    if (!converged) {
       pendingDeferredRange = {
-        startLine: Math.max(0, tokenized.processedEndLine + 1),
+        startLine: nextDeferredStartLine,
         endLine: Math.max(0, currentLines.length - 1),
       }
       doc.tokenizationPending = true
@@ -480,6 +808,7 @@ export function createDoc(tokenize: Tokenizer = defaultIncrementalTokenizer) {
   const initial = tokenizeAll(doc.tokenize, buffer.lines.value)
   doc.tokenLines = initial.tokenLines
   doc.tokenStates = initial.states
+  firstUnresolvedTokenLine = -1
   bumpTokenVersion()
 
   buffer.onChange(change => {
@@ -508,13 +837,18 @@ export function createDoc(tokenize: Tokenizer = defaultIncrementalTokenizer) {
 
     const endLineBefore = startLine + deletedLineCount
     const endLineAfter = startLine + insertedLineCount
+    shiftUnresolvedLineForSplice(startLine, endLineBefore, endLineAfter, lineCount)
     const snapshotsAligned = alignTokenSnapshotsForSpliceInPlace(
       doc.tokenLines,
       doc.tokenStates,
-      lineCount,
+      nextLines,
+      startLine,
       endLineBefore,
       endLineAfter,
     )
+    if (snapshotsAligned) {
+      markUnresolvedFromLine(startLine, nextLines)
+    }
 
     applyTokenization(
       'sync',

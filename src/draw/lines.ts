@@ -500,7 +500,29 @@ export function drawLines(context: Context) {
   const headerHeight = context.header.value?.height ?? 0
   const visibleTop = -headerHeight - paddingTop
   const visibleBottom = height - paddingTop
-  const visualLines = context.lines.getVisibleVisualLines(visibleTop, visibleBottom, y)
+  const approximateVisibleRange = context.lines.getApproxVisibleLogicalRange(visibleTop, visibleBottom, y)
+  let optimisticViewportRetokenized = false
+  if (approximateVisibleRange) {
+    optimisticViewportRetokenized = context.doc.optimisticallyTokenizeViewport(
+      approximateVisibleRange.start,
+      approximateVisibleRange.end,
+    )
+  }
+
+  let visualLines = context.lines.getVisibleVisualLines(visibleTop, visibleBottom, y)
+  if (!approximateVisibleRange && visualLines.length > 0) {
+    let startLine = visualLines[0].logicalLine
+    let endLine = startLine
+    for (let i = 1; i < visualLines.length; i++) {
+      const logicalLine = visualLines[i].logicalLine
+      if (logicalLine < startLine) startLine = logicalLine
+      if (logicalLine > endLine) endLine = logicalLine
+    }
+    optimisticViewportRetokenized = context.doc.optimisticallyTokenizeViewport(startLine, endLine)
+  }
+  if (optimisticViewportRetokenized) {
+    visualLines = context.lines.getVisibleVisualLines(visibleTop, visibleBottom, y)
+  }
   if (visualLines.length === 0) return
   if (!useDirectDraw) {
     context.caches.setLineCanvasBudget(Math.max(64, visualLines.length * 3))

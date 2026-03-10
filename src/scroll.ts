@@ -1,6 +1,6 @@
 import { batch, computed, effect, type Signal, signal, untracked } from '@preact/signals-core'
 import type { Canvas } from './canvas.ts'
-import { HORIZONTAL_SCROLLBAR_SIZE, VERTICAL_SCROLLBAR_SIZE } from './draw/scrollbar.ts'
+import { getVerticalScrollbarSize, HORIZONTAL_SCROLLBAR_SIZE } from './draw/scrollbar.ts'
 import type { Gutter } from './gutter.ts'
 import type { Header } from './header.ts'
 import { signalify } from './lib/signalify.ts'
@@ -50,18 +50,22 @@ export function createScroll(canvas: Canvas, lines: Lines, settings: Settings, g
   const scrollWidth = computed(() => {
     if (settings.wordWrap) return 0
     const headerHeight = header.value?.height ?? 0
+    const verticalScrollbarSize = getVerticalScrollbarSize(settings)
     const needsVertical =
-      lines.totalHeight.value > canvas.size.height.value - headerHeight - settings.paddingTop - settings.paddingBottom
+      settings.showMinimap
+      || lines.totalHeight.value > canvas.size.height.value - headerHeight - settings.paddingTop - settings.paddingBottom
     const availableWidth = canvas.size.width.value - settings.paddingLeft - settings.paddingRight - gutter.width.value
-      - (needsVertical ? VERTICAL_SCROLLBAR_SIZE : 0)
+      - (needsVertical ? verticalScrollbarSize : 0)
     return Math.min(0, -lines.totalWidth.value + availableWidth)
   })
   const scrollHeight = computed(() => {
     const headerHeight = header.value?.height ?? 0
+    const verticalScrollbarSize = getVerticalScrollbarSize(settings)
     const needsVertical =
-      lines.totalHeight.value > canvas.size.height.value - headerHeight - settings.paddingTop - settings.paddingBottom
+      settings.showMinimap
+      || lines.totalHeight.value > canvas.size.height.value - headerHeight - settings.paddingTop - settings.paddingBottom
     const availableWidth = canvas.size.width.value - settings.paddingLeft - settings.paddingRight - gutter.width.value
-      - (needsVertical ? VERTICAL_SCROLLBAR_SIZE : 0)
+      - (needsVertical ? verticalScrollbarSize : 0)
     const needsHorizontal = !settings.wordWrap && lines.totalWidth.value > availableWidth
     const availableHeight = canvas.size.height.value - headerHeight - settings.paddingTop - settings.paddingBottom
       - (needsHorizontal ? HORIZONTAL_SCROLLBAR_SIZE : 0)
@@ -121,10 +125,12 @@ export function createScroll(canvas: Canvas, lines: Lines, settings: Settings, g
     }
 
     const headerHeight = header.value?.height ?? 0
+    const verticalScrollbarSize = getVerticalScrollbarSize(settings)
     const needsVertical = approxContentMetrics.totalHeight
       > canvas.size.height.value - headerHeight - settings.paddingTop - settings.paddingBottom
+      || settings.showMinimap
     const availableWidth = canvas.size.width.value - settings.paddingLeft - settings.paddingRight - gutter.width.value
-      - (needsVertical ? VERTICAL_SCROLLBAR_SIZE : 0)
+      - (needsVertical ? verticalScrollbarSize : 0)
     const minScrollX = settings.wordWrap ? 0 : Math.min(0, -approxContentMetrics.totalWidth + availableWidth)
 
     const needsHorizontal = !settings.wordWrap && approxContentMetrics.totalWidth > availableWidth

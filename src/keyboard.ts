@@ -5,7 +5,7 @@ import type { Canvas } from './canvas.ts'
 import type { Caret } from './caret.ts'
 import { createClipboard } from './clipboard.ts'
 import type { Doc } from './doc.ts'
-import { HORIZONTAL_SCROLLBAR_SIZE, VERTICAL_SCROLLBAR_SIZE } from './draw/scrollbar.ts'
+import { getVerticalScrollbarSize, HORIZONTAL_SCROLLBAR_SIZE } from './draw/scrollbar.ts'
 import type { Header } from './header.ts'
 import {
   findVisualLineForColumn,
@@ -1029,11 +1029,12 @@ export function createKeyboard(
     }
 
     const headerHeight = header.value?.height ?? 0
+    const verticalScrollbarSize = getVerticalScrollbarSize(settings)
     const needsVertical =
       lines.totalHeight.value > canvas.size.height.value - headerHeight - settings.paddingTop - settings.paddingBottom
     const availableWidth = canvas.size.width.value - settings.paddingLeft
       - metrics.gutterWidth.value
-      - (needsVertical ? VERTICAL_SCROLLBAR_SIZE : 0)
+      - (needsVertical ? verticalScrollbarSize : 0)
     const needsHorizontal = !settings.wordWrap && lines.totalWidth.value > availableWidth
     const availableHeight = canvas.size.height.value - headerHeight - settings.paddingTop - settings.paddingBottom
       - (needsHorizontal ? HORIZONTAL_SCROLLBAR_SIZE : 0)
@@ -1128,11 +1129,12 @@ export function createKeyboard(
     }
 
     const headerHeight = header.value?.height ?? 0
+    const verticalScrollbarSize = getVerticalScrollbarSize(settings)
     const needsVertical =
       lines.totalHeight.value > canvas.size.height.value - headerHeight - settings.paddingTop - settings.paddingBottom
     const availableWidth = canvas.size.width.value - settings.paddingLeft
       - metrics.gutterWidth.value
-      - (needsVertical ? VERTICAL_SCROLLBAR_SIZE : 0)
+      - (needsVertical ? verticalScrollbarSize : 0)
     const needsHorizontal = lines.totalWidth.value > availableWidth
     const availableHeight = canvas.size.height.value - headerHeight - settings.paddingTop - settings.paddingBottom
       - (needsHorizontal ? HORIZONTAL_SCROLLBAR_SIZE : 0)
@@ -1632,10 +1634,11 @@ export function createKeyboard(
       : null
     const estimatedTotalHeight = approxContentMetrics?.totalHeight
       ?? Math.max(targetY, codeLines.length * settings.lineHeight)
+    const verticalScrollbarSize = getVerticalScrollbarSize(settings)
     const needsVertical = estimatedTotalHeight > canvas.size.height.value
     const availableWidth = canvas.size.width.value - settings.paddingLeft
       - metrics.gutterWidth.value
-      - (needsVertical ? VERTICAL_SCROLLBAR_SIZE : 0)
+      - (needsVertical ? verticalScrollbarSize : 0)
     const estimatedTotalWidth = approxContentMetrics?.totalWidth
       ?? (settings.wordWrap ? availableWidth : Math.max(availableWidth, caretX + 2))
     const needsHorizontal = !settings.wordWrap && estimatedTotalWidth > availableWidth
