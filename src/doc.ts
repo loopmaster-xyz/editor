@@ -979,9 +979,16 @@ export function createDoc(tokenize: Tokenizer = defaultIncrementalTokenizer) {
         hotTokenizedEndLine = hotEndLine
       }
 
+      const isStructuralLineChange = endLineAfter !== endLineBefore
       // Avoid per-keystroke tokenVersion churn while a key is held; this keeps
       // brace/cache rebuilders from thrashing during fast typing.
-      if ((prealignedChanged || hotTokenizedChanged) && !doc.keyHoldActive) bumpTokenVersion()
+      // Structural line changes (e.g. holding Enter/Backspace across lines) must still bump
+      // so brace guides can invalidate stale topology as line mappings shift.
+      if ((prealignedChanged || hotTokenizedChanged || isStructuralLineChange)
+        && (!doc.keyHoldActive || isStructuralLineChange))
+      {
+        bumpTokenVersion()
+      }
 
       const processedStartLine = Math.max(0, startLine)
       const optimisticProcessedEndLine = Math.max(0, Math.max(endLineBefore, endLineAfter))

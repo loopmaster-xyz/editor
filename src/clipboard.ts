@@ -1,6 +1,10 @@
 import type { Doc } from './doc.ts'
 import type { Selection } from './selection.ts'
-import { getTextareaElement, setActiveClipboard } from './textarea-singleton.ts'
+import {
+  getTextareaElement,
+  setActiveClipboard,
+  shouldSuppressCaretVisibleOnRefocus,
+} from './textarea-singleton.ts'
 import type { Canvas } from './canvas.ts'
 
 export type Clipboard = ReturnType<typeof createClipboard>
@@ -442,7 +446,9 @@ export function createClipboard(
     if (pendingPasteText.length > 0) {
       flushPendingPaste()
     }
-    maybeEnsureCaretVisible(true)
+    if (!shouldSuppressCaretVisibleOnRefocus()) {
+      maybeEnsureCaretVisible(true)
+    }
   }
 
   const handlers = {

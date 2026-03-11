@@ -394,44 +394,26 @@ export function drawBlocks(context: Context) {
     return chain
   }
 
-  const areBlockChainsEqual = (a: number[], b: number[]): boolean => {
-    if (a.length !== b.length) return false
-    for (let i = 0; i < a.length; i++) {
-      if (a[i] !== b[i]) return false
-    }
-    return true
-  }
-
   if (!useOptimisticTopology && optimisticSnapshot) {
-    const stableContainingBlockAtCaret = blocks.findContainingBlockStart(caret.line.value)
-    const optimisticContainingBlockAtCaret = findOptimisticContainingBlockStart(caret.line.value)
-    if (
-      optimisticContainingBlockAtCaret !== null
-      && optimisticContainingBlockAtCaret !== stableContainingBlockAtCaret
-    ) {
-      useOptimisticTopology = true
-    }
+    const linesToValidate = [caret.line.value, ...visibleLinesArray]
+    for (let i = 0; i < linesToValidate.length; i++) {
+      const line = linesToValidate[i]
+      const optimisticContainingBlock = findOptimisticContainingBlockStart(line)
+      if (optimisticContainingBlock === null) continue
 
-    if (!useOptimisticTopology) {
-      for (let i = 0; i < visibleLinesArray.length; i++) {
-        const line = visibleLinesArray[i]
-        const optimisticContainingBlock = findOptimisticContainingBlockStart(line)
-        if (optimisticContainingBlock === null) continue
-        const stableContainingBlock = blocks.findContainingBlockStart(line)
-        if (!doesStableContainLine(line, stableContainingBlock)) {
-          useOptimisticTopology = true
-          break
-        }
-        if (stableContainingBlock !== optimisticContainingBlock) {
-          useOptimisticTopology = true
-          break
-        }
-        const optimisticChain = getOptimisticBlockChain(line)
-        const stableChain = getStableBlockChain(line)
-        if (!areBlockChainsEqual(optimisticChain, stableChain)) {
-          useOptimisticTopology = true
-          break
-        }
+      const stableContainingBlock = blocks.findContainingBlockStart(line)
+      if (!doesStableContainLine(line, stableContainingBlock)) {
+        useOptimisticTopology = true
+        break
+      }
+
+      const optimisticChain = getOptimisticBlockChain(line)
+      const stableChain = getStableBlockChain(line)
+      if (stableChain.length < optimisticChain.length) {
+        // Only fall back when stable topology is missing inner levels.
+        // Avoid broad mismatch-based fallback that can keep stale topology latched.
+        useOptimisticTopology = true
+        break
       }
     }
   }
