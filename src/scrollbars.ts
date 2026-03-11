@@ -1,6 +1,12 @@
 import { signal, type Signal } from '@preact/signals-core'
 import type { Canvas } from './canvas.ts'
-import { getVerticalScrollbarSize, hitTestScrollbar, HORIZONTAL_SCROLLBAR_SIZE } from './draw/scrollbar.ts'
+import {
+  getVerticalScrollbarMetrics,
+  getVerticalScrollbarSize,
+  hitTestScrollbar,
+  HORIZONTAL_SCROLLBAR_SIZE,
+} from './draw/scrollbar.ts'
+import type { Doc } from './doc.ts'
 import type { Gutter } from './gutter.ts'
 import type { Header } from './header.ts'
 import type { Lines } from './lines.ts'
@@ -11,6 +17,7 @@ export type Scrollbars = ReturnType<typeof createScrollbars>
 const SCROLLBAR_MIN_THUMB = 20
 
 export function createScrollbars(canvas: Canvas, scroll: Scroll, lines: Lines, settings: Settings, gutter: Gutter,
+  doc: Doc,
   header: Signal<Header>)
 {
   const isDragging = signal(false)
@@ -52,14 +59,6 @@ export function createScrollbars(canvas: Canvas, scroll: Scroll, lines: Lines, s
     }
   }
 
-  const getVerticalThumbMetrics = (layout: ReturnType<typeof getLayout>) => {
-    const trackHeight = layout.height - layout.headerHeight
-    const thumbHeightUnclamped = Math.max(SCROLLBAR_MIN_THUMB, (layout.availableHeight / layout.totalHeight)
-      * trackHeight)
-    const thumbHeight = Math.min(trackHeight, thumbHeightUnclamped)
-    return { trackHeight, thumbHeight }
-  }
-
   const getHorizontalThumbMetrics = (layout: ReturnType<typeof getLayout>) => {
     const trackWidth = layout.width - (layout.needsVertical ? layout.verticalScrollbarSize : 0)
     const thumbWidthUnclamped = Math.max(SCROLLBAR_MIN_THUMB, (layout.availableWidthForHorizontal / layout.totalWidth)
@@ -73,13 +72,27 @@ export function createScrollbars(canvas: Canvas, scroll: Scroll, lines: Lines, s
 
     const layout = getLayout()
     if (dragType === 'vertical') {
-      const { trackHeight, thumbHeight } = getVerticalThumbMetrics(layout)
-      const dragDelta = y - dragStartY
-      const trackLength = trackHeight - thumbHeight
-      const scrollRange = -layout.scrollHeight
-      if (trackLength > 0 && scrollRange > 0) {
-        const scrollRatio = dragDelta / trackLength
-        scroll.targetY.value = dragStartScrollY - scrollRatio * scrollRange
+      const verticalMetrics = getVerticalScrollbarMetrics(
+        canvas,
+        scroll,
+        lines,
+        settings,
+        gutter,
+        header,
+        doc.lines.length,
+      )
+      if (verticalMetrics) {
+        const dragDelta = y - dragStartY
+        const trackLength = verticalMetrics.thumbTrackHeight - verticalMetrics.thumbHeight
+        const scrollRange = -verticalMetrics.scrollHeight
+        if (trackLength > 0 && scrollRange > 0) {
+          const scrollRatio = dragDelta / trackLength
+          const nextScrollY = Math.max(
+            layout.scrollHeight,
+            Math.min(0, dragStartScrollY - scrollRatio * scrollRange),
+          )
+          scroll.targetY.value = nextScrollY
+        }
       }
     }
     else if (dragType === 'horizontal') {
@@ -89,13 +102,14 @@ export function createScrollbars(canvas: Canvas, scroll: Scroll, lines: Lines, s
       const scrollRange = -layout.scrollWidth
       if (trackLength > 0 && scrollRange > 0) {
         const scrollRatio = dragDelta / trackLength
-        scroll.targetX.value = dragStartScrollX - scrollRatio * scrollRange
+        const nextScrollX = Math.max(layout.scrollWidth, Math.min(0, dragStartScrollX - scrollRatio * scrollRange))
+        scroll.targetX.value = nextScrollX
       }
     }
   }
 
   const handleMouseDown = (x: number, y: number): boolean => {
-    const hit = hitTestScrollbar(canvas, scroll, lines, settings, gutter, header, x, y)
+    const hit = hitTestScrollbar(canvas, scroll, lines, settings, gutter, header, x, y, doc.lines.length)
     if (!hit.type) return false
 
     const layout = getLayout()
@@ -111,20 +125,34 @@ export function createScrollbars(canvas: Canvas, scroll: Scroll, lines: Lines, s
     }
     else if (hit.type && !hit.thumb) {
       if (hit.type === 'vertical') {
-        const { trackHeight, thumbHeight } = getVerticalThumbMetrics(layout)
-        const trackLength = trackHeight - thumbHeight
-        const scrollRange = -layout.scrollHeight
-        if (trackLength > 0 && scrollRange > 0) {
-          const clickRatio = (y - layout.headerHeight - thumbHeight / 2) / trackLength
-          const newScrollY = -Math.max(0, Math.min(1, clickRatio)) * scrollRange
-          scroll.targetY.value = newScrollY
-          isDragging.value = true
-          dragType = 'vertical'
-          dragStartX = x
-          dragStartY = y
-          dragStartScrollX = scroll.targetX.value
-          dragStartScrollY = newScrollY
-          return true
+        const verticalMetrics = getVerticalScrollbarMetrics(
+          canvas,
+          scroll,
+          lines,
+          settings,
+          gutter,
+          header,
+          doc.lines.length,
+        )
+        if (verticalMetrics) {
+          const trackLength = verticalMetrics.thumbTrackHeight - verticalMetrics.thumbHeight
+          const scrollRange = -verticalMetrics.scrollHeight
+          if (trackLength > 0 && scrollRange > 0) {
+            const clickRatio = (y - verticalMetrics.trackY - verticalMetrics.thumbHeight / 2) / trackLength
+            const clampedRatio = Math.max(0, Math.min(1, clickRatio))
+            const newScrollY = -clampedRatio * scrollRange
+            const thumbCenterY = verticalMetrics.trackY
+              + clampedRatio * trackLength
+              + verticalMetrics.thumbHeight / 2
+            scroll.targetY.value = newScrollY
+            isDragging.value = true
+            dragType = 'vertical'
+            dragStartX = x
+            dragStartY = thumbCenterY
+            dragStartScrollX = scroll.targetX.value
+            dragStartScrollY = newScrollY
+            return true
+          }
         }
       }
       else if (hit.type === 'horizontal') {
@@ -133,11 +161,13 @@ export function createScrollbars(canvas: Canvas, scroll: Scroll, lines: Lines, s
         const scrollRange = -layout.scrollWidth
         if (trackLength > 0 && scrollRange > 0) {
           const clickRatio = (x - thumbWidth / 2) / trackLength
-          const newScrollX = -Math.max(0, Math.min(1, clickRatio)) * scrollRange
+          const clampedRatio = Math.max(0, Math.min(1, clickRatio))
+          const newScrollX = -clampedRatio * scrollRange
+          const thumbCenterX = clampedRatio * trackLength + thumbWidth / 2
           scroll.targetX.value = newScrollX
           isDragging.value = true
           dragType = 'horizontal'
-          dragStartX = x
+          dragStartX = thumbCenterX
           dragStartY = y
           dragStartScrollX = newScrollX
           dragStartScrollY = scroll.targetY.value
@@ -154,7 +184,7 @@ export function createScrollbars(canvas: Canvas, scroll: Scroll, lines: Lines, s
 
     isDragging.value = false
     dragType = null
-    const hit = hitTestScrollbar(canvas, scroll, lines, settings, gutter, header, x, y)
+    const hit = hitTestScrollbar(canvas, scroll, lines, settings, gutter, header, x, y, doc.lines.length)
     return hit.type
   }
 

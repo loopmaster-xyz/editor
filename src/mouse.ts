@@ -704,7 +704,7 @@ export function createMouse(
     const headerHeight = header.value?.height ?? 0
     const inHeader = y >= 0 && y < headerHeight
     const gutterHit = hitTestGutter(canvas, settings, lines, scroll, gutter, x, y, headerHeight)
-    const scrollbarHit = hitTestScrollbar(canvas, scroll, lines, settings, gutter, header, x, y)
+    const scrollbarHit = hitTestScrollbar(canvas, scroll, lines, settings, gutter, header, x, y, doc.lines.length)
     const canHitWidget = y >= headerHeight && gutterHit.type === null && scrollbarHit.type === null
     const widgetHover = canHitWidget && (findBelowWidgetHit(x, y) !== null || findBeforeAfterWidgetHit(x, y) !== null)
 
@@ -1408,7 +1408,17 @@ export function createMouse(
       const worldY = pos.y - headerHeight - settings.paddingTop - scroll.pos.y
       hoverHitPos.value = { worldX, worldY }
       lastHoverMoveTime.value = Date.now()
-      const hit = hitTestScrollbar(canvas, scroll, lines, settings, gutter, header, pos.x, pos.y)
+      const hit = hitTestScrollbar(
+        canvas,
+        scroll,
+        lines,
+        settings,
+        gutter,
+        header,
+        pos.x,
+        pos.y,
+        doc.lines.length,
+      )
       hovered.scrollbar = hit.type
 
       if (hit.type) {
@@ -1587,7 +1597,7 @@ export function createMouse(
       return
     }
 
-    const hit = hitTestScrollbar(canvas, scroll, lines, settings, gutter, header, pos.x, pos.y)
+    const hit = hitTestScrollbar(canvas, scroll, lines, settings, gutter, header, pos.x, pos.y, doc.lines.length)
     if (!hit.type) {
       const lineColumn = findLineColumnFromPosition(pos.x, pos.y)
 

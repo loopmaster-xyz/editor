@@ -989,6 +989,16 @@ export interface ScrollbarHit {
   thumb: boolean
 }
 
+export interface VerticalScrollbarMetrics {
+  scrollbarX: number
+  trackY: number
+  trackHeight: number
+  thumbTrackHeight: number
+  thumbHeight: number
+  thumbY: number
+  scrollHeight: number
+}
+
 export function getVerticalScrollbarSize(settings: Settings): number {
   return settings.showMinimap ? MINIMAP_SCROLLBAR_SIZE : VERTICAL_SCROLLBAR_SIZE
 }
@@ -1039,24 +1049,131 @@ function getScrollbarLayout(
   }
 }
 
-function getVerticalThumbMetrics(layout: ScrollbarLayout, scrollY = layout.scrollY) {
+function getMinimapViewportMetrics(
+  lineCountInput: number,
+  fullTrackHeight: number,
+  verticalScrollbarSize: number,
+  canvasDpr = 1,
+) {
+  const lineCount = Math.max(1, lineCountInput)
+  const minimapPixelScale = Math.max(1, canvasDpr)
+  const alignToDevicePixels = (value: number) => Math.round(value * minimapPixelScale) / minimapPixelScale
+  const minimapHeight = Math.max(
+    1 / minimapPixelScale,
+    alignToDevicePixels(fullTrackHeight - MINIMAP_INNER_PADDING * 2),
+  )
+  const minimapWidth = Math.max(
+    1 / minimapPixelScale,
+    alignToDevicePixels(verticalScrollbarSize - MINIMAP_INNER_PADDING * 2),
+  )
+  const maxPixelRowScale = Math.max(1, Math.round(MINIMAP_BITMAP_ROW_SCALE * minimapPixelScale))
+  const maxTotalSourceRows = Math.max(1, Math.floor(MINIMAP_MAX_SURFACE_PIXELS / maxPixelRowScale))
+  const geometry = computeMinimapGeometry(
+    lineCount,
+    minimapHeight,
+    minimapWidth,
+    maxTotalSourceRows,
+  )
+  const pixelRowScale = Math.max(1, Math.round(geometry.rowScale * minimapPixelScale))
+  const targetDrawHeight = Math.max(1, Math.round(minimapHeight))
+  const sourceHeight = Math.max(
+    1,
+    Math.min(
+      geometry.totalSourceRows,
+      Math.round((targetDrawHeight * minimapPixelScale) / pixelRowScale),
+    ),
+  )
+  const drawHeight = Math.max(1, (sourceHeight * pixelRowScale) / minimapPixelScale)
+  return {
+    minimapHeight,
+    minimapWidth,
+    geometry,
+    sourceHeight,
+    drawHeight,
+    minimapPixelScale,
+  }
+}
+
+export function getMinimapTrackHeightForLineCount(
+  lineCountInput: number,
+  fullTrackHeight: number,
+  verticalScrollbarSize: number,
+  canvasDpr = 1,
+): number {
+  const { drawHeight } = getMinimapViewportMetrics(
+    lineCountInput,
+    fullTrackHeight,
+    verticalScrollbarSize,
+    canvasDpr,
+  )
+  return Math.max(
+    SCROLLBAR_MIN_THUMB,
+    Math.min(fullTrackHeight, drawHeight + MINIMAP_INNER_PADDING * 2),
+  )
+}
+
+function getVerticalThumbMetrics(
+  layout: ScrollbarLayout,
+  scrollY = layout.scrollY,
+  minimapLineCount?: number,
+  canvasDpr = 1,
+) {
   const scrollbarX = layout.width - layout.verticalScrollbarSize
+  const trackY = layout.headerHeight
   const trackHeight = layout.height - layout.headerHeight
+  let thumbTrackHeight = trackHeight
+
+  if (layout.verticalScrollbarSize === MINIMAP_SCROLLBAR_SIZE) {
+    const fallbackLineCount = Math.max(1, Math.round(layout.totalHeight / 16))
+    thumbTrackHeight = getMinimapTrackHeightForLineCount(
+      minimapLineCount ?? fallbackLineCount,
+      trackHeight,
+      layout.verticalScrollbarSize,
+      canvasDpr,
+    )
+  }
+
   const thumbHeightUnclamped = Math.max(
     SCROLLBAR_MIN_THUMB,
-    (layout.availableHeight / layout.totalHeight) * trackHeight,
+    (layout.availableHeight / layout.totalHeight) * thumbTrackHeight,
   )
-  const thumbHeight = Math.min(trackHeight, thumbHeightUnclamped)
-  const trackLength = Math.max(0, trackHeight - thumbHeight)
+  const thumbHeight = Math.min(thumbTrackHeight, thumbHeightUnclamped)
+  const trackLength = Math.max(0, thumbTrackHeight - thumbHeight)
   const scrollRange = -layout.scrollHeight
   const scrollRatio = scrollRange > 0 ? Math.max(0, Math.min(1, -scrollY / scrollRange)) : 0
-  const thumbY = layout.headerHeight + scrollRatio * trackLength
+  const thumbY = trackY + scrollRatio * trackLength
 
   return {
     scrollbarX,
+    trackY,
     trackHeight,
+    thumbTrackHeight,
     thumbHeight,
     thumbY,
+  }
+}
+
+export function getVerticalScrollbarMetrics(
+  canvas: Canvas,
+  scroll: Scroll,
+  lines: Lines,
+  settings: Settings,
+  gutter: Gutter,
+  header: Signal<Header>,
+  minimapLineCount?: number,
+  scrollYOverride?: number,
+): VerticalScrollbarMetrics | null {
+  const layout = getScrollbarLayout(canvas, scroll, lines, settings, gutter, header)
+  if (!layout.needsVertical) return null
+  const metrics = getVerticalThumbMetrics(
+    layout,
+    scrollYOverride ?? layout.scrollY,
+    minimapLineCount,
+    canvas.dpr.value,
+  )
+  return {
+    ...metrics,
+    scrollHeight: layout.scrollHeight,
   }
 }
 
@@ -1069,12 +1186,30 @@ export function hitTestScrollbar(
   header: Signal<Header>,
   x: number,
   y: number,
+  minimapLineCount?: number,
 ): ScrollbarHit {
   const layout = getScrollbarLayout(canvas, scroll, lines, settings, gutter, header)
 
   if (layout.needsVertical) {
-    const { scrollbarX, thumbHeight, thumbY } = getVerticalThumbMetrics(layout)
-    if (x >= scrollbarX && x <= layout.width && y >= layout.headerHeight) {
+    const verticalMetrics = getVerticalScrollbarMetrics(
+      canvas,
+      scroll,
+      lines,
+      settings,
+      gutter,
+      header,
+      minimapLineCount,
+      layout.scrollY,
+    )
+    if (
+      verticalMetrics
+      && x >= verticalMetrics.scrollbarX
+      && x <= layout.width
+      && y >= verticalMetrics.trackY
+      && y <= verticalMetrics.trackY
+        + (settings.showMinimap ? verticalMetrics.trackHeight : verticalMetrics.thumbTrackHeight)
+    ) {
+      const { thumbY, thumbHeight } = verticalMetrics
       const isThumb = y >= thumbY && y <= thumbY + thumbHeight
       return { type: 'vertical', thumb: isThumb }
     }
@@ -1105,36 +1240,35 @@ export function drawScrollbars(context: Context) {
   const layout = getScrollbarLayout(canvas, scroll, lines, settings, gutter, header)
 
   if (layout.needsVertical) {
-    const liveScrollY = scroll.pos.y === Infinity ? layout.scrollY : scroll.pos.y
-    const { scrollbarX, trackHeight, thumbHeight, thumbY } = getVerticalThumbMetrics(layout, liveScrollY)
+    const liveScrollY = context.scrollbars.isDragging.value
+      ? layout.scrollY
+      : (scroll.pos.y === Infinity ? layout.scrollY : scroll.pos.y)
+    const { scrollbarX, trackY, trackHeight, thumbHeight, thumbY } = getVerticalThumbMetrics(
+      layout,
+      liveScrollY,
+      context.doc.lines.length,
+      canvas.dpr.value,
+    )
     const isHovered = context.mouse.hovered.scrollbar === 'vertical'
 
     if (settings.showMinimap) {
       const canvasDpr = Math.max(1, canvas.dpr.value)
       const alignToDevicePixels = (value: number) => Math.round(value * canvasDpr) / canvasDpr
+      const fullTrackHeight = layout.height - layout.headerHeight
       c.fillStyle = getMinimapBackgroundCss(context, isHovered)
-      c.fillRect(scrollbarX, layout.headerHeight, layout.verticalScrollbarSize, trackHeight)
-      drawMinimapLeftShadow(c, scrollbarX, layout.headerHeight, trackHeight)
+      c.fillRect(scrollbarX, layout.headerHeight, layout.verticalScrollbarSize, fullTrackHeight)
+      drawMinimapLeftShadow(c, scrollbarX, layout.headerHeight, fullTrackHeight)
 
-      const minimapX = alignToDevicePixels(scrollbarX + MINIMAP_INNER_PADDING)
-      const minimapY = alignToDevicePixels(layout.headerHeight + MINIMAP_INNER_PADDING)
-      const minimapWidth = Math.max(1 / canvasDpr,
-        alignToDevicePixels(layout.verticalScrollbarSize - MINIMAP_INNER_PADDING * 2))
-      const minimapHeight = Math.max(1 / canvasDpr, alignToDevicePixels(trackHeight - MINIMAP_INNER_PADDING * 2))
       const lineCount = Math.max(1, context.doc.lines.length)
-      const minimapPixelScale = Math.max(1, canvasDpr)
-      const maxPixelRowScale = Math.max(1, Math.round(MINIMAP_BITMAP_ROW_SCALE * minimapPixelScale))
-      const maxTotalSourceRows = Math.max(1, Math.floor(MINIMAP_MAX_SURFACE_PIXELS / maxPixelRowScale))
-      const geometry = computeMinimapGeometry(lineCount, minimapHeight, minimapWidth, maxTotalSourceRows)
-      const pixelRowScale = Math.max(1, Math.round(geometry.rowScale * minimapPixelScale))
-      const targetDrawHeight = Math.max(1, Math.round(minimapHeight))
-      const sourceHeight = Math.max(
-        1,
-        Math.min(
-          geometry.totalSourceRows,
-          Math.round((targetDrawHeight * minimapPixelScale) / pixelRowScale),
-        ),
+      const minimapMetrics = getMinimapViewportMetrics(
+        lineCount,
+        trackHeight,
+        layout.verticalScrollbarSize,
+        canvasDpr,
       )
+      const minimapX = alignToDevicePixels(scrollbarX + MINIMAP_INNER_PADDING)
+      const minimapY = alignToDevicePixels(trackY + MINIMAP_INNER_PADDING)
+      const { geometry, sourceHeight, drawHeight, minimapPixelScale } = minimapMetrics
 
       const scrollRangeY = -layout.scrollHeight
       const scrollRatioY = scrollRangeY > 0 ? Math.max(0, Math.min(1, -liveScrollY / scrollRangeY)) : 0
@@ -1144,7 +1278,6 @@ export function drawScrollbars(context: Context) {
       const compression = buildCompressionState(lineCount, geometry, sourceHeight, minimapPixelScale)
       // Draw at the exact CSS size that maps to the source pixel crop to avoid stretch blits.
       const drawWidth = Math.max(1, compression.pixelColumnCount / compression.pixelScale)
-      const drawHeight = Math.max(1, (sourceHeight * compression.pixelRowScale) / compression.pixelScale)
       const theme = getMinimapThemeSnapshot(context)
       const state = getMinimapRenderState(context)
       const rawContentKey = makeMinimapContentKey(context.doc.tokenVersion, theme.themeKey)

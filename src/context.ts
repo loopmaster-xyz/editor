@@ -50,7 +50,7 @@ export function createContext(editorSettings: Partial<EditorSettings>, doc: Doc,
   const gutter = createGutter(doc, canvas, metrics, settings, caches, blocks, lines)
   const scroll = createScroll(canvas, lines, settings, gutter, header, metrics)
   blocks.setScrollSource(scroll)
-  const scrollbars = createScrollbars(canvas, scroll, lines, settings, gutter, header)
+  const scrollbars = createScrollbars(canvas, scroll, lines, settings, gutter, doc, header)
   const caret = createCaret(settings)
   const selection = createSelection()
   let pinnedError: DocError | null = null
