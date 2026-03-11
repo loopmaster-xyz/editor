@@ -136,6 +136,18 @@ const operators = new Set([
   ':',
 ])
 
+const operatorsByFirstChar = new Map<number, string[]>()
+for (const op of operators) {
+  const first = op.charCodeAt(0)
+  const list = operatorsByFirstChar.get(first)
+  if (list) list.push(op)
+  else operatorsByFirstChar.set(first, [op])
+}
+for (const [first, list] of operatorsByFirstChar) {
+  list.sort((a, b) => b.length - a.length)
+  operatorsByFirstChar.set(first, list)
+}
+
 const punctuation = new Set([
   '(',
   ')',
@@ -157,6 +169,27 @@ type DecodedLineState = {
 const STATE_IN_BLOCK_COMMENT = 1 << 0
 const STATE_IN_TEMPLATE_STRING = 1 << 1
 
+const codeLf = 10
+const codeCr = 13
+const codeTab = 9
+const codeVt = 11
+const codeFf = 12
+const codeSpace = 32
+const codeSlash = 47
+const codeStar = 42
+const codeBackslash = 92
+const codeSingleQuote = 39
+const codeDoubleQuote = 34
+const codeBacktick = 96
+const codeDot = 46
+const codeLParen = 40
+const codePlus = 43
+const codeMinus = 45
+const codeLowerE = 101
+const codeUpperE = 69
+const codeUnderscore = 95
+const codeDollar = 36
+
 function decodeState(prevState: unknown): DecodedLineState {
   const stateBits = typeof prevState === 'number' ? prevState : 0
   return {
@@ -172,20 +205,31 @@ function encodeState(state: DecodedLineState): number {
   return bits
 }
 
-function isWhitespace(char: string): boolean {
-  return /\s/.test(char)
+function isWhitespaceCode(code: number): boolean {
+  return (
+    code === codeSpace
+    || code === codeTab
+    || code === codeLf
+    || code === codeCr
+    || code === codeVt
+    || code === codeFf
+  )
 }
 
-function isDigit(char: string): boolean {
-  return /[0-9]/.test(char)
+function isDigitCode(code: number): boolean {
+  return code >= 48 && code <= 57
 }
 
-function isLetter(char: string): boolean {
-  return /[a-zA-Z_]/.test(char)
+function isLetterCode(code: number): boolean {
+  return (
+    (code >= 65 && code <= 90)
+    || (code >= 97 && code <= 122)
+    || code === codeUnderscore
+  )
 }
 
-function isIdentifierChar(char: string): boolean {
-  return isLetter(char) || isDigit(char) || char === '_' || char === '$'
+function isIdentifierCode(code: number): boolean {
+  return isLetterCode(code) || isDigitCode(code) || code === codeDollar
 }
 
 function tokenizeLineInternal(
@@ -194,23 +238,21 @@ function tokenizeLineInternal(
 ): { tokens: Token[]; state: number } {
   const tokens: Token[] = []
   const state = decodeState(prevState)
+  const n = input.length
   let i = 0
 
   if (state.inBlockComment) {
-    let comment = ''
-    while (i < input.length) {
-      const char = input[i]
-      if (char === '*' && input[i + 1] === '/') {
-        comment += '*/'
+    const start = i
+    while (i < n) {
+      if (input.charCodeAt(i) === codeStar && input.charCodeAt(i + 1) === codeSlash) {
         i += 2
         state.inBlockComment = false
         break
       }
-      comment += char
       i++
     }
-    if (comment.length > 0) {
-      tokens.push({ text: comment, type: 'comment' })
+    if (i > start) {
+      tokens.push({ text: input.slice(start, i), type: 'comment' })
     }
     if (state.inBlockComment) {
       return { tokens, state: encodeState(state) }
@@ -218,204 +260,169 @@ function tokenizeLineInternal(
   }
 
   if (state.inTemplateString) {
-    let string = ''
+    const start = i
     let escaped = false
-    while (i < input.length) {
-      const char = input[i]
+    while (i < n) {
+      const code = input.charCodeAt(i)
       if (escaped) {
-        string += char
         escaped = false
         i++
         continue
       }
-      if (char === '\\') {
-        string += char
+      if (code === codeBackslash) {
         escaped = true
         i++
         continue
       }
-      if (char === '`') {
-        string += char
-        i++
+      i++
+      if (code === codeBacktick) {
         state.inTemplateString = false
         break
       }
-      string += char
-      i++
     }
-    if (string.length > 0) {
-      tokens.push({ text: string, type: 'string' })
+    if (i > start) {
+      tokens.push({ text: input.slice(start, i), type: 'string' })
     }
     if (state.inTemplateString) {
       return { tokens, state: encodeState(state) }
     }
   }
 
-  while (i < input.length) {
-    const char = input[i]
+  while (i < n) {
+    const start = i
+    const code = input.charCodeAt(i)
 
-    if (isWhitespace(char)) {
-      let whitespace = ''
-      while (i < input.length && isWhitespace(input[i])) {
-        whitespace += input[i]
-        i++
-      }
-      if (whitespace.length > 0) {
-        tokens.push({ text: whitespace, type: 'text' })
-      }
+    if (isWhitespaceCode(code)) {
+      i++
+      while (i < n && isWhitespaceCode(input.charCodeAt(i))) i++
+      tokens.push({ text: input.slice(start, i), type: 'text' })
       continue
     }
 
-    if (char === '/' && input[i + 1] === '/') {
-      const comment = input.slice(i)
-      tokens.push({ text: comment, type: 'comment' })
+    if (code === codeSlash && input.charCodeAt(i + 1) === codeSlash) {
+      tokens.push({ text: input.slice(i), type: 'comment' })
       break
     }
 
-    if (char === '/' && input[i + 1] === '*') {
-      let comment = '/*'
+    if (code === codeSlash && input.charCodeAt(i + 1) === codeStar) {
       i += 2
-      while (i < input.length) {
-        if (input[i] === '*' && input[i + 1] === '/') {
-          comment += '*/'
-          i += 2
-          break
-        }
-        comment += input[i]
-        i++
-      }
-      if (!comment.endsWith('*/')) {
-        state.inBlockComment = true
-      }
-      tokens.push({ text: comment, type: 'comment' })
-      if (state.inBlockComment) {
-        break
-      }
-      continue
-    }
-
-    if (char === '"' || char === '\'') {
-      const quote = char
-      let string = quote
-      i++
-      let escaped = false
-      while (i < input.length) {
-        if (escaped) {
-          string += input[i]
-          escaped = false
-          i++
-          continue
-        }
-        if (input[i] === '\\') {
-          string += input[i]
-          escaped = true
-          i++
-          continue
-        }
-        if (input[i] === quote) {
-          string += input[i]
-          i++
-          break
-        }
-        string += input[i]
-        i++
-      }
-      tokens.push({ text: string, type: 'string' })
-      continue
-    }
-
-    if (char === '`') {
-      let string = '`'
-      i++
-      let escaped = false
       let closed = false
-      while (i < input.length) {
-        if (escaped) {
-          string += input[i]
-          escaped = false
-          i++
-          continue
-        }
-        if (input[i] === '\\') {
-          string += input[i]
-          escaped = true
-          i++
-          continue
-        }
-        if (input[i] === '`') {
-          string += input[i]
-          i++
+      while (i < n) {
+        if (input.charCodeAt(i) === codeStar && input.charCodeAt(i + 1) === codeSlash) {
+          i += 2
           closed = true
           break
         }
-        string += input[i]
         i++
+      }
+      if (!closed) {
+        state.inBlockComment = true
+      }
+      tokens.push({ text: input.slice(start, i), type: 'comment' })
+      if (state.inBlockComment) break
+      continue
+    }
+
+    if (code === codeSingleQuote || code === codeDoubleQuote) {
+      const quote = code
+      i++
+      let escaped = false
+      while (i < n) {
+        const c = input.charCodeAt(i)
+        if (escaped) {
+          escaped = false
+          i++
+          continue
+        }
+        if (c === codeBackslash) {
+          escaped = true
+          i++
+          continue
+        }
+        i++
+        if (c === quote) break
+      }
+      tokens.push({ text: input.slice(start, i), type: 'string' })
+      continue
+    }
+
+    if (code === codeBacktick) {
+      i++
+      let escaped = false
+      let closed = false
+      while (i < n) {
+        const c = input.charCodeAt(i)
+        if (escaped) {
+          escaped = false
+          i++
+          continue
+        }
+        if (c === codeBackslash) {
+          escaped = true
+          i++
+          continue
+        }
+        i++
+        if (c === codeBacktick) {
+          closed = true
+          break
+        }
       }
       if (!closed) {
         state.inTemplateString = true
       }
-      tokens.push({ text: string, type: 'string' })
+      tokens.push({ text: input.slice(start, i), type: 'string' })
       continue
     }
 
-    if (isDigit(char) || (char === '.' && isDigit(input[i + 1]))) {
-      let number = ''
-      if (char === '.') {
-        number += char
+    if (isDigitCode(code) || (code === codeDot && isDigitCode(input.charCodeAt(i + 1)))) {
+      if (code === codeDot) i++
+      while (i < n && isDigitCode(input.charCodeAt(i))) i++
+
+      if (input.charCodeAt(i) === codeDot && isDigitCode(input.charCodeAt(i + 1))) {
         i++
+        while (i < n && isDigitCode(input.charCodeAt(i))) i++
       }
-      while (i < input.length && isDigit(input[i])) {
-        number += input[i]
+
+      const e = input.charCodeAt(i)
+      if (e === codeLowerE || e === codeUpperE) {
         i++
+        const sign = input.charCodeAt(i)
+        if (sign === codePlus || sign === codeMinus) i++
+        while (i < n && isDigitCode(input.charCodeAt(i))) i++
       }
-      if (input[i] === '.' && isDigit(input[i + 1])) {
-        number += input[i]
-        i++
-        while (i < input.length && isDigit(input[i])) {
-          number += input[i]
-          i++
-        }
-      }
-      if (input[i] === 'e' || input[i] === 'E') {
-        number += input[i]
-        i++
-        if (input[i] === '+' || input[i] === '-') {
-          number += input[i]
-          i++
-        }
-        while (i < input.length && isDigit(input[i])) {
-          number += input[i]
-          i++
-        }
-      }
-      tokens.push({ text: number, type: 'number' })
+
+      tokens.push({ text: input.slice(start, i), type: 'number' })
       continue
     }
 
-    let matched = false
-    for (let len = 4; len >= 1; len--) {
-      const candidate = input.slice(i, i + len)
-      if (operators.has(candidate)) {
-        tokens.push({ text: candidate, type: 'operator' })
-        i += len
-        matched = true
-        break
+    const ops = operatorsByFirstChar.get(code)
+    if (ops) {
+      let matched = false
+      for (let oi = 0; oi < ops.length; oi++) {
+        const op = ops[oi]
+        if (input.startsWith(op, i)) {
+          tokens.push({ text: op, type: 'operator' })
+          i += op.length
+          matched = true
+          break
+        }
       }
+      if (matched) continue
     }
-    if (matched) continue
 
+    const char = input[i]!
     if (punctuation.has(char)) {
       tokens.push({ text: char, type: 'punctuation' })
       i++
       continue
     }
 
-    if (isLetter(char)) {
-      let identifier = ''
-      while (i < input.length && isIdentifierChar(input[i])) {
-        identifier += input[i]
-        i++
-      }
+    if (isLetterCode(code)) {
+      i++
+      while (i < n && isIdentifierCode(input.charCodeAt(i))) i++
+
+      const identifier = input.slice(start, i)
       let type: TokenType = 'identifier'
       if (keywords.has(identifier)) {
         type = 'keyword'
@@ -426,15 +433,15 @@ function tokenizeLineInternal(
       else if (identifier === 'null' || identifier === 'undefined') {
         type = 'null'
       }
-      else if (i < input.length && input[i] === '(') {
+      else if (input.charCodeAt(i) === codeLParen) {
         type = 'function'
       }
       tokens.push({ text: identifier, type })
       continue
     }
 
-    tokens.push({ text: char, type: 'text' })
     i++
+    tokens.push({ text: input.slice(start, i), type: 'text' })
   }
 
   return { tokens, state: encodeState(state) }

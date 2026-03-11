@@ -2838,6 +2838,21 @@ export function createKeyboard(
         return
       }
 
+      const normalizedKey = event.key.toLowerCase()
+      const normalizedCode = (event.code || '').toLowerCase()
+      const isPasteShortcut = (event.ctrlKey || event.metaKey)
+        && !event.altKey
+        && (normalizedKey === 'v' || normalizedCode === 'keyv')
+      const isShiftInsertPaste = !event.ctrlKey
+        && !event.metaKey
+        && event.shiftKey
+        && normalizedKey === 'insert'
+      if (isPasteShortcut || isShiftInsertPaste) {
+        // Let native paste fire without entering key-hold mode; this keeps scroll/caret
+        // updates responsive during rapid Ctrl/Cmd+V bursts.
+        return
+      }
+
       pressedInputKeys.add(event.code || event.key)
       updateKeyHoldActive()
 
@@ -2881,6 +2896,14 @@ export function createKeyboard(
       metaKey.value = event.metaKey
       altKey.value = event.altKey
 
+      if ((event.key === 'Control' || event.key === 'Meta') && pressedInputKeys.size > 0) {
+        // Some platforms can swallow the paired keyup (e.g. "V" in Ctrl/Cmd+V).
+        // Clearing here prevents keyHoldActive from getting stuck until blur.
+        pressedInputKeys.clear()
+        updateKeyHoldActive()
+        return
+      }
+
       if (!NON_KEYS.has(event.key)) {
         pressedInputKeys.delete(event.code || event.key)
         updateKeyHoldActive()
@@ -2889,7 +2912,7 @@ export function createKeyboard(
   }
 
   clipboard = createClipboard(doc, selection, insertText, deleteSelection, ensureCaretVisible, handleKeyDown,
-    handleKeyUp, canvas)
+    handleKeyUp, canvas, updateKeyHoldActive)
 
   const textarea = getTextareaElement()
   const handleTextareaFocus = () => {

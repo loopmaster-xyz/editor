@@ -692,6 +692,8 @@ interface LogicalLineLayoutCache {
 }
 
 interface VisualLayoutCacheState {
+  revision: number
+  tokenVersion: number
   maxWidth: number
   baseAvailableWidth: number
   lineHeight: number
@@ -700,6 +702,8 @@ interface VisualLayoutCacheState {
   lineLayouts: LogicalLineLayoutCache[]
   lineHeights: number[]
   heightIndex: FenwickTree
+  totalWidth: number
+  totalHeight: number
 }
 
 interface VisualLayoutOutput {
@@ -812,14 +816,16 @@ export function createLines(
       ? baseAvailableWidth - verticalScrollbarSize
       : Infinity
 
-    if (widgetsRef !== cachedWidgetsRef) {
+    const widgetsChanged = widgetsRef !== cachedWidgetsRef
+    if (widgetsChanged) {
       cachedWidgetsRef = widgetsRef
       cachedWidgetsIndex = buildWidgetsByLogicalLineIndex(widgetsRef)
     }
     const widgetsByLogicalLine = cachedWidgetsIndex.map
     const hasAboveOrFullWidgets = cachedWidgetsIndex.hasAboveOrFull
 
-    if (errorsRef !== cachedErrorsRef) {
+    const errorsChanged = errorsRef !== cachedErrorsRef
+    if (errorsChanged) {
       cachedErrorsRef = errorsRef
       cachedErrorsByLine = buildErrorsByLogicalLineIndex(errorsRef)
     }
@@ -828,6 +834,44 @@ export function createLines(
     const hasCollapsed = doc.collapsed.size > 0
     const collapsedLines = doc.collapsed
     const collapsedBlockEnds = hasCollapsed ? blocks.blockEnds.value : null
+
+    const canReuseNoWrapResizeLayout = previousLayout !== null
+      && !settings.wordWrap
+      && !hasAboveOrFullWidgets
+      && !hasCollapsed
+      && !widgetsChanged
+      && !errorsChanged
+      && previousLayout.wordWrap === false
+      && previousLayout.lineHeight === settings.lineHeight
+      && previousLayout.fontSize === settings.fontSize
+      && previousLayout.lineLayouts.length === tokenLines.length
+      && previousLayout.revision === doc.revision
+      && previousLayout.tokenVersion === doc.tokenVersion
+      && previousLayout.baseAvailableWidth !== baseAvailableWidth
+      && previousLayout.maxWidth === Infinity
+      && maxWidth === Infinity
+
+    if (canReuseNoWrapResizeLayout) {
+      const reusedLayout = previousLayout
+      reusedLayout.baseAvailableWidth = baseAvailableWidth
+      reusedLayout.maxWidth = maxWidth
+      latestCaretLayoutSnapshot = {
+        lineLayouts: reusedLayout.lineLayouts,
+        heightIndex: reusedLayout.heightIndex,
+        totalWidth: reusedLayout.totalWidth,
+        totalHeight: reusedLayout.totalHeight,
+      }
+      return {
+        visualLines: EMPTY_VISUAL_LINES,
+        visualLinesByLogicalLine: [],
+        lineLayouts: reusedLayout.lineLayouts,
+        lineHeights: reusedLayout.lineHeights,
+        heightIndex: reusedLayout.heightIndex,
+        hasAboveOrFullWidgets: false,
+        totalWidth: reusedLayout.totalWidth,
+        totalHeight: reusedLayout.totalHeight,
+      }
+    }
 
     const canIncrementalLayoutPatch = previousLayout !== null
       && tokenChange !== null
@@ -1097,6 +1141,8 @@ export function createLines(
       }
 
       previousLayout = {
+        revision: doc.revision,
+        tokenVersion: doc.tokenVersion,
         maxWidth,
         baseAvailableWidth,
         lineHeight: settings.lineHeight,
@@ -1105,6 +1151,8 @@ export function createLines(
         lineLayouts: outputLineLayouts,
         lineHeights: outputLineHeights,
         heightIndex: outputHeightIndex,
+        totalWidth: nextTotalWidth,
+        totalHeight: outputTotalHeight,
       }
       return {
         visualLines: outputVisualLines,
@@ -1236,6 +1284,8 @@ export function createLines(
 
     if (!hasAboveOrFullWidgets) {
       previousLayout = {
+        revision: doc.revision,
+        tokenVersion: doc.tokenVersion,
         maxWidth,
         baseAvailableWidth,
         lineHeight: settings.lineHeight,
@@ -1244,6 +1294,8 @@ export function createLines(
         lineLayouts: processedLineLayouts,
         lineHeights: processedLineHeights,
         heightIndex: processedHeightIndex,
+        totalWidth: nextTotalWidth,
+        totalHeight: nextTotalHeight,
       }
     }
     else {

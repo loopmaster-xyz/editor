@@ -4,7 +4,6 @@ import type { Context } from '../context.ts'
 import type { Gutter } from '../gutter.ts'
 import type { Header } from '../header.ts'
 import type { Lines } from '../lines.ts'
-import workerUrl from '../minimap-worker.ts?worker&url'
 import type {
   MinimapErrorMessage,
   MinimapRenderChunkRequestMessage,
@@ -12,6 +11,7 @@ import type {
   MinimapThemePayload,
   MinimapWorkerResponseMessage,
 } from '../minimap-protocol.ts'
+import workerUrl from '../minimap-worker.ts?worker&url'
 import type { Scroll } from '../scroll.ts'
 import type { Settings } from '../settings.ts'
 import type { Token, TokenType } from '../token.ts'
@@ -30,13 +30,16 @@ const MINIMAP_VIEWPORT_HOVER_COLOR = 'rgba(255, 255, 255, 0.14)'
 const MINIMAP_INNER_PADDING = 4
 const MINIMAP_BASE_ROW_HEIGHT = 2
 const MINIMAP_MIN_ROW_HEIGHT = 1
-const MINIMAP_DENSITY_RANGE = 2
-const MINIMAP_MAX_VIRTUAL_ROWS = 1800
-const MINIMAP_MAX_COMPRESSED_LINES_PER_ROW = 3
+const MINIMAP_DENSITY_RANGE = 1
+const MINIMAP_MAX_VIRTUAL_ROWS = 3000
+const MINIMAP_MAX_COMPRESSED_LINES_PER_ROW = 1
 const MINIMAP_BITMAP_ROW_SCALE = 1
 const MINIMAP_BURST_WINDOW_MS = 120
 const MINIMAP_WORKER_THROTTLE_BURST_MS = 120
-const MINIMAP_WORKER_THROTTLE_SETTLE_MS = 36
+const MINIMAP_WORKER_THROTTLE_SETTLE_MS = 24
+const MINIMAP_MAX_CHUNK_LINES = 1536
+const MINIMAP_MAX_SURFACE_PIXELS = 32767
+const MINIMAP_MAX_LINE_CHARS = 100
 const MINIMAP_BACKGROUND_ALPHA = 0.62
 const MINIMAP_BACKGROUND_HOVER_ALPHA = 0.52
 const MINIMAP_LEFT_SHADOW_WIDTH = 7
@@ -105,6 +108,10 @@ type MinimapCompressionState = {
   totalSourceRows: number
   chunkRowCount: number
   chunkCount: number
+  pixelScale: number
+  pixelColumnCount: number
+  pixelRowScale: number
+  pixelTotalSourceRows: number
 }
 
 type MinimapSurface = {
@@ -120,12 +127,17 @@ type MinimapSnapshot = {
 }
 
 type MinimapRenderState = {
+  context: Context
   contextId: number
   compression: MinimapCompressionState | null
   contentKey: string | null
+  renderContentKey: string | null
   stitchSurface: MinimapSurface | null
   latchedViewportSurface: MinimapSurface | null
   latchedViewportCompressionKey: string | null
+  latchedViewportSourceStart: number
+  latchedViewportSourceHeight: number
+  latchedViewportContentKey: string | null
   readyChunks: Set<number>
   chunkContentKey: Map<number, string>
   pendingSnapshot: MinimapSnapshot | null
@@ -151,6 +163,8 @@ let minimapRequestId = 0
 const minimapRenderStateByContext = new WeakMap<Context, MinimapRenderState>()
 const minimapWorkerRequests = new Map<number, MinimapWorkerRequestMeta>()
 const parsedColorCache = new Map<string, Rgb>()
+const EMPTY_MINIMAP_TOKEN_LINE: Token[] = []
+const minimapCompactTokenLineCache = new WeakMap<Token[], Token[]>()
 
 function clampByte(value: number): number {
   return Math.max(0, Math.min(255, value | 0))
@@ -296,30 +310,77 @@ function isMinimapBurstMode(context: Context): boolean {
   return context.doc.keyHoldActive || inputAgeMs <= MINIMAP_BURST_WINDOW_MS
 }
 
-function makeMinimapContentKey(revision: number, tokenVersion: number, themeKey: string): string {
-  return `${revision}:${tokenVersion}:${themeKey}`
+function makeMinimapContentKey(tokenVersion: number, themeKey: string): string {
+  return `${tokenVersion}:${themeKey}`
 }
 
-function prepareTokenLinesForWorker(lines: string[], tokenLines: Token[][]): Token[][] {
-  const prepared = new Array<Token[]>(lines.length)
-  for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
-    const lineTokens = tokenLines[lineIndex]
-    if (!lineTokens || lineTokens.length === 0) {
-      prepared[lineIndex] = []
-      continue
-    }
+function isWhitespaceOnlyLine(text: string): boolean {
+  for (let i = 0; i < text.length; i++) {
+    if (text.charCodeAt(i) > 32) return false
+  }
+  return text.length > 0
+}
 
-    const sanitized: Token[] = []
-    for (let tokenIndex = 0; tokenIndex < lineTokens.length; tokenIndex++) {
-      const token = lineTokens[tokenIndex]
-      const text = token?.text ?? ''
-      if (text.length === 0) continue
-      sanitized.push({
-        type: token?.type ?? 'text',
-        text,
-      })
+function createFallbackTokenLineForWorker(line: string): Token[] {
+  if (line.length === 0 || isWhitespaceOnlyLine(line)) return EMPTY_MINIMAP_TOKEN_LINE
+  return [{
+    type: 'text',
+    text: line.length > MINIMAP_MAX_LINE_CHARS ? line.slice(0, MINIMAP_MAX_LINE_CHARS) : line,
+  }]
+}
+
+function compactTokenLineForWorker(tokenLine: Token[] | undefined): Token[] {
+  if (!tokenLine || tokenLine.length === 0) return EMPTY_MINIMAP_TOKEN_LINE
+  const cached = minimapCompactTokenLineCache.get(tokenLine)
+  if (cached) return cached
+
+  let needsCopy = false
+  for (let i = 0; i < tokenLine.length; i++) {
+    const token = tokenLine[i]
+    const text = token?.text ?? ''
+    if (text.length === 0 || token?.type == null) {
+      needsCopy = true
+      break
     }
-    prepared[lineIndex] = sanitized
+    if ((token as { line?: number }).line !== undefined
+      || (token as { column?: number }).column !== undefined)
+    {
+      needsCopy = true
+      break
+    }
+  }
+
+  if (!needsCopy) {
+    minimapCompactTokenLineCache.set(tokenLine, tokenLine)
+    return tokenLine
+  }
+
+  const compact: Token[] = []
+  for (let i = 0; i < tokenLine.length; i++) {
+    const token = tokenLine[i]
+    const text = token?.text ?? ''
+    if (text.length === 0) continue
+    compact.push({
+      type: token?.type ?? 'text',
+      text,
+    })
+  }
+  const result = compact.length > 0 ? compact : EMPTY_MINIMAP_TOKEN_LINE
+  minimapCompactTokenLineCache.set(tokenLine, result)
+  return result
+}
+
+function prepareTokenLinesForWorker(lines: string[], tokenLines: Token[][], startLine: number, lineCount: number):
+  Token[][]
+{
+  if (lineCount <= 0) return []
+  const prepared = new Array<Token[]>(lineCount)
+  for (let lineIndex = 0; lineIndex < lineCount; lineIndex++) {
+    const absoluteLine = startLine + lineIndex
+    const compact = compactTokenLineForWorker(tokenLines[absoluteLine])
+    prepared[lineIndex] = compact !== EMPTY_MINIMAP_TOKEN_LINE
+      ? compact
+      : createFallbackTokenLineForWorker(lines[absoluteLine] ?? '')
   }
   return prepared
 }
@@ -329,12 +390,17 @@ function getMinimapRenderState(context: Context): MinimapRenderState {
   if (existing) return existing
 
   const state: MinimapRenderState = {
+    context,
     contextId: ++minimapContextId,
     compression: null,
     contentKey: null,
+    renderContentKey: null,
     stitchSurface: null,
     latchedViewportSurface: null,
     latchedViewportCompressionKey: null,
+    latchedViewportSourceStart: -1,
+    latchedViewportSourceHeight: -1,
+    latchedViewportContentKey: null,
     readyChunks: new Set<number>(),
     chunkContentKey: new Map<number, string>(),
     pendingSnapshot: null,
@@ -438,14 +504,17 @@ function ensureMinimapWorker(): Worker | null {
     if (!compression
       || request.compressionKey !== compression.key
       || result.compressionKey !== compression.key
-      || request.chunkIndex !== result.chunkIndex
-      || request.contentKey !== state.contentKey)
+      || request.chunkIndex !== result.chunkIndex)
     {
       closeBitmap(result.bitmap)
       return
     }
 
-    const stitchSurface = ensureSurface(state.stitchSurface, compression.columnCount, compression.totalSourceRows)
+    const stitchSurface = ensureSurface(
+      state.stitchSurface,
+      compression.pixelColumnCount,
+      compression.pixelTotalSourceRows,
+    )
     if (!stitchSurface) {
       closeBitmap(result.bitmap)
       return
@@ -453,7 +522,7 @@ function ensureMinimapWorker(): Worker | null {
     state.stitchSurface = stitchSurface
 
     const chunkHeight = Math.max(1, result.rowCount * result.rowScale)
-    stitchSurface.c.clearRect(0, result.chunkStartRow, compression.columnCount, chunkHeight)
+    stitchSurface.c.clearRect(0, result.chunkStartRow, compression.pixelColumnCount, chunkHeight)
     if (result.hasInk) {
       stitchSurface.c.drawImage(result.bitmap, 0, result.chunkStartRow)
     }
@@ -461,6 +530,11 @@ function ensureMinimapWorker(): Worker | null {
     state.readyChunks.add(result.chunkIndex)
     state.chunkContentKey.set(result.chunkIndex, result.contentKey)
     closeBitmap(result.bitmap)
+
+    if (state.pendingSnapshot && state.inFlightRequestId == null) {
+      const theme = getMinimapThemeSnapshot(state.context)
+      tryDispatchMinimapRequest(state.context, state, compression, theme)
+    }
   }
 
   minimapWorker = worker
@@ -472,10 +546,18 @@ function resetCompressionState(state: MinimapRenderState, compression: MinimapCo
   state.readyChunks.clear()
   state.chunkContentKey.clear()
   state.pendingSnapshot = null
+  state.renderContentKey = state.contentKey
+  state.latchedViewportSourceStart = -1
+  state.latchedViewportSourceHeight = -1
+  state.latchedViewportContentKey = null
 
-  state.stitchSurface = ensureSurface(state.stitchSurface, compression.columnCount, compression.totalSourceRows)
+  state.stitchSurface = ensureSurface(
+    state.stitchSurface,
+    compression.pixelColumnCount,
+    compression.pixelTotalSourceRows,
+  )
   if (state.stitchSurface) {
-    state.stitchSurface.c.clearRect(0, 0, compression.columnCount, compression.totalSourceRows)
+    state.stitchSurface.c.clearRect(0, 0, compression.pixelColumnCount, compression.pixelTotalSourceRows)
   }
 }
 
@@ -520,7 +602,9 @@ function pickNextChunkIndexForSnapshot(
   return -1
 }
 
-function isChunkReadyForContent(state: MinimapRenderState, chunkIndex: number, contentKey: string, strict: boolean): boolean {
+function isChunkReadyForContent(state: MinimapRenderState, chunkIndex: number, contentKey: string,
+  strict: boolean): boolean
+{
   if (!state.readyChunks.has(chunkIndex)) return false
   if (!strict) return true
   return state.chunkContentKey.get(chunkIndex) === contentKey
@@ -559,45 +643,59 @@ function drawMinimapFromCache(
 
   const sourceStart = Math.max(0, Math.floor(sourceY))
   const sourceHeightInt = Math.max(1, Math.ceil(sourceHeight))
+  const sourceStartPx = sourceStart * compression.pixelRowScale
+  const sourceHeightPx = sourceHeightInt * compression.pixelRowScale
 
   const canDrawCurrent = isViewportCovered(state, compression, sourceStart, sourceHeightInt, contentKey, true)
+  const shouldDrawFromStitch = canDrawCurrent
 
   const previousSmoothing = c.imageSmoothingEnabled
   c.imageSmoothingEnabled = false
 
-  if (canDrawCurrent && state.stitchSurface) {
+  if (shouldDrawFromStitch && state.stitchSurface) {
     c.drawImage(
       state.stitchSurface.canvas,
       0,
-      sourceStart,
-      compression.columnCount,
-      sourceHeightInt,
+      sourceStartPx,
+      compression.pixelColumnCount,
+      sourceHeightPx,
       drawX,
       drawY,
       drawWidth,
       drawHeight,
     )
 
-    const latchedViewportSurface = ensureSurface(
-      state.latchedViewportSurface,
-      Math.max(1, Math.round(drawWidth)),
-      Math.max(1, Math.round(drawHeight)),
-    )
-    if (latchedViewportSurface) {
-      latchedViewportSurface.c.clearRect(0, 0, latchedViewportSurface.width, latchedViewportSurface.height)
-      latchedViewportSurface.c.drawImage(
-        state.stitchSurface.canvas,
-        0,
-        sourceStart,
-        compression.columnCount,
-        sourceHeightInt,
-        0,
-        0,
-        latchedViewportSurface.width,
-        latchedViewportSurface.height,
+    const latchedContentKey = contentKey
+    const shouldUpdateLatched = state.latchedViewportCompressionKey !== compression.key
+      || state.latchedViewportSourceStart !== sourceStart
+      || state.latchedViewportSourceHeight !== sourceHeightInt
+      || state.latchedViewportContentKey !== latchedContentKey
+
+    if (shouldUpdateLatched) {
+      const latchedViewportSurface = ensureSurface(
+        state.latchedViewportSurface,
+        compression.pixelColumnCount,
+        sourceHeightPx,
       )
-      state.latchedViewportSurface = latchedViewportSurface
-      state.latchedViewportCompressionKey = compression.key
+      if (latchedViewportSurface) {
+        latchedViewportSurface.c.clearRect(0, 0, latchedViewportSurface.width, latchedViewportSurface.height)
+        latchedViewportSurface.c.drawImage(
+          state.stitchSurface.canvas,
+          0,
+          sourceStartPx,
+          compression.pixelColumnCount,
+          sourceHeightPx,
+          0,
+          0,
+          compression.pixelColumnCount,
+          sourceHeightPx,
+        )
+        state.latchedViewportSurface = latchedViewportSurface
+        state.latchedViewportCompressionKey = compression.key
+        state.latchedViewportSourceStart = sourceStart
+        state.latchedViewportSourceHeight = sourceHeightInt
+        state.latchedViewportContentKey = latchedContentKey
+      }
     }
 
     c.imageSmoothingEnabled = previousSmoothing
@@ -636,34 +734,76 @@ function tryDispatchMinimapRequest(
   const worker = ensureMinimapWorker()
   if (!worker) return
 
-  const contentKey = state.contentKey
-  if (!contentKey) return
+  const latestContentKey = state.contentKey
+  if (!latestContentKey) return
+  if (!state.renderContentKey) {
+    state.renderContentKey = latestContentKey
+  }
 
   const snapshot = state.pendingSnapshot
-  const targetChunkIndex = pickNextChunkIndexForSnapshot(
+  let dispatchContentKey = state.renderContentKey
+  if (
+    dispatchContentKey !== latestContentKey
+    && isViewportCovered(state, compression, snapshot.sourceY, snapshot.sourceHeight, dispatchContentKey, true)
+  ) {
+    // Once the currently visible viewport is fully reconciled, jump to latest content.
+    dispatchContentKey = latestContentKey
+    state.renderContentKey = latestContentKey
+  }
+
+  let targetChunkIndex = pickNextChunkIndexForSnapshot(
     state,
     compression,
     snapshot.sourceY,
     snapshot.sourceHeight,
-    contentKey,
+    dispatchContentKey,
   )
+  if (targetChunkIndex < 0 && dispatchContentKey !== latestContentKey) {
+    dispatchContentKey = latestContentKey
+    state.renderContentKey = latestContentKey
+    targetChunkIndex = pickNextChunkIndexForSnapshot(
+      state,
+      compression,
+      snapshot.sourceY,
+      snapshot.sourceHeight,
+      dispatchContentKey,
+    )
+  }
   if (targetChunkIndex < 0) {
     state.pendingSnapshot = null
     return
   }
 
   const now = Date.now()
-  if (now - state.lastDispatchAt < state.throttleMs) return
+  const viewportNeedsUrgentFill = !isViewportCovered(
+    state,
+    compression,
+    snapshot.sourceY,
+    snapshot.sourceHeight,
+    dispatchContentKey,
+    true,
+  )
+  const throttleMs = viewportNeedsUrgentFill ? 0 : state.throttleMs
+  if (now - state.lastDispatchAt < throttleMs) return
 
   const chunkStartRow = targetChunkIndex * compression.chunkRowCount
   const rowCount = Math.max(1, Math.min(compression.chunkRowCount, compression.totalSourceRows - chunkStartRow))
   const chunkEndRow = chunkStartRow + rowCount
   const lineStart = chunkStartRow * compression.lineSpan
   const lineEnd = Math.min(compression.lineCount, chunkEndRow * compression.lineSpan)
+  const lineCount = Math.max(0, lineEnd - lineStart)
+  if (lineCount <= 0) {
+    const chunkPixelStart = chunkStartRow * compression.pixelRowScale
+    const chunkPixelHeight = Math.max(1, rowCount * compression.pixelRowScale)
+    state.stitchSurface?.c.clearRect(0, chunkPixelStart, compression.pixelColumnCount, chunkPixelHeight)
+    state.readyChunks.add(targetChunkIndex)
+    state.chunkContentKey.set(targetChunkIndex, dispatchContentKey)
+    // Keep draining the current snapshot until viewport coverage is complete.
+    tryDispatchMinimapRequest(context, state, compression, theme)
+    return
+  }
 
-  const linesSlice = context.doc.lines.slice(lineStart, lineEnd)
-  const tokenLinesSlice = context.doc.tokenLines.slice(lineStart, lineEnd)
-  const tokenLines = prepareTokenLinesForWorker(linesSlice, tokenLinesSlice)
+  const tokenLines = prepareTokenLinesForWorker(context.doc.lines, context.doc.tokenLines, lineStart, lineCount)
 
   const requestId = ++minimapRequestId
   const message: MinimapRenderChunkRequestMessage = {
@@ -673,29 +813,27 @@ function tryDispatchMinimapRequest(
     revision: context.doc.revision,
     tokenVersion: context.doc.tokenVersion,
     compressionKey: compression.key,
-    contentKey,
+    contentKey: dispatchContentKey,
     chunkIndex: targetChunkIndex,
-    chunkStartRow,
+    chunkStartRow: chunkStartRow * compression.pixelRowScale,
     rowCount,
     lineSpan: compression.lineSpan,
-    columnCount: compression.columnCount,
-    rowScale: compression.rowScale,
-    lines: linesSlice,
+    columnCount: compression.pixelColumnCount,
+    rowScale: compression.pixelRowScale,
     tokenLines,
     theme: theme.payload,
   }
 
-  state.pendingSnapshot = null
   state.inFlightRequestId = requestId
   state.inFlightChunkIndex = targetChunkIndex
   state.inFlightCompressionKey = compression.key
-  state.inFlightContentKey = contentKey
+  state.inFlightContentKey = dispatchContentKey
   state.lastDispatchAt = now
 
   minimapWorkerRequests.set(requestId, {
     state,
     compressionKey: compression.key,
-    contentKey,
+    contentKey: dispatchContentKey,
     chunkIndex: targetChunkIndex,
   })
 
@@ -724,6 +862,35 @@ function queueSnapshotRender(
   burstMode: boolean,
 ) {
   state.throttleMs = getMinimapWorkerThrottleDelay(burstMode)
+  const snapshotChunkIndex = Math.max(
+    0,
+    Math.min(compression.chunkCount - 1, Math.floor(sourceY / compression.chunkRowCount)),
+  )
+
+  if (
+    state.inFlightRequestId != null
+    && state.inFlightChunkIndex === snapshotChunkIndex
+    && state.inFlightCompressionKey === compression.key
+    && state.inFlightContentKey === state.contentKey
+  ) {
+    return
+  }
+
+  if (state.pendingSnapshot) {
+    const pendingChunkIndex = Math.max(
+      0,
+      Math.min(compression.chunkCount - 1, Math.floor(state.pendingSnapshot.sourceY / compression.chunkRowCount)),
+    )
+    if (pendingChunkIndex === snapshotChunkIndex
+      && Math.round(state.pendingSnapshot.sourceHeight) === Math.round(sourceHeight))
+    {
+      // Keep pumping even when the snapshot target is unchanged; otherwise we can deadlock
+      // waiting for a same-target pending snapshot to dispatch after in-flight completion.
+      tryDispatchMinimapRequest(context, state, compression, theme)
+      return
+    }
+  }
+
   state.pendingSnapshot = {
     sourceY,
     sourceHeight,
@@ -732,7 +899,12 @@ function queueSnapshotRender(
   tryDispatchMinimapRequest(context, state, compression, theme)
 }
 
-function computeMinimapGeometry(lineCount: number, minimapHeight: number, minimapWidth: number): MinimapGeometryStats {
+function computeMinimapGeometry(
+  lineCount: number,
+  minimapHeight: number,
+  minimapWidth: number,
+  maxTotalSourceRows = Number.POSITIVE_INFINITY,
+): MinimapGeometryStats {
   const density = lineCount / MINIMAP_MAX_VIRTUAL_ROWS
   const densityT = density <= 1 ? 0 : Math.min(1, (density - 1) / MINIMAP_DENSITY_RANGE)
   const targetRowHeight = MINIMAP_BASE_ROW_HEIGHT
@@ -753,6 +925,22 @@ function computeMinimapGeometry(lineCount: number, minimapHeight: number, minima
   const rowScale = MINIMAP_BITMAP_ROW_SCALE
   const totalSourceRows = Math.max(1, virtualRowCount * rowScale)
 
+  if (totalSourceRows > maxTotalSourceRows) {
+    const clampedLineSpan = Math.max(lineSpan, Math.ceil(lineCount / Math.max(1, maxTotalSourceRows)))
+    const clampedVirtualRowCount = Math.max(1, Math.ceil(lineCount / clampedLineSpan))
+    const clampedMode: 'compressed' | 'windowed' = clampedLineSpan > MINIMAP_MAX_COMPRESSED_LINES_PER_ROW
+      ? 'windowed'
+      : 'compressed'
+    return {
+      lineSpan: clampedLineSpan,
+      virtualRowCount: clampedVirtualRowCount,
+      columnCount,
+      rowScale,
+      totalSourceRows: Math.max(1, clampedVirtualRowCount * rowScale),
+      mode: clampedMode,
+    }
+  }
+
   return {
     lineSpan,
     virtualRowCount,
@@ -767,12 +955,18 @@ function buildCompressionState(
   lineCount: number,
   geometry: MinimapGeometryStats,
   sourceHeight: number,
+  pixelScale: number,
 ): MinimapCompressionState {
-  const chunkRowCount = geometry.mode === 'windowed'
-    ? Math.max(1, Math.min(geometry.totalSourceRows, sourceHeight))
-    : geometry.totalSourceRows
+  const maxChunkRowsByLineBudget = Math.max(1, Math.floor(MINIMAP_MAX_CHUNK_LINES / geometry.lineSpan))
+  const modeChunkRowCount = Math.max(1, Math.min(geometry.totalSourceRows, sourceHeight))
+  const chunkRowCount = Math.max(1, Math.min(modeChunkRowCount, maxChunkRowsByLineBudget))
   const chunkCount = Math.max(1, Math.ceil(geometry.totalSourceRows / chunkRowCount))
-  const key = `${geometry.lineSpan}:${geometry.columnCount}:${geometry.rowScale}:${geometry.totalSourceRows}:${chunkRowCount}`
+  const pixelRowScale = Math.max(1, Math.round(geometry.rowScale * pixelScale))
+  const pixelColumnCount = Math.max(1, Math.round(geometry.columnCount * pixelScale))
+  const pixelTotalSourceRows = Math.max(1, geometry.totalSourceRows * pixelRowScale)
+  const key =
+    `${geometry.lineSpan}:${geometry.columnCount}:${geometry.rowScale}:${geometry.totalSourceRows}:${chunkRowCount}:`
+    + `${pixelScale}:${pixelColumnCount}:${pixelRowScale}`
 
   return {
     key,
@@ -783,6 +977,10 @@ function buildCompressionState(
     totalSourceRows: geometry.totalSourceRows,
     chunkRowCount,
     chunkCount,
+    pixelScale,
+    pixelColumnCount,
+    pixelRowScale,
+    pixelTotalSourceRows,
   }
 }
 
@@ -912,35 +1110,48 @@ export function drawScrollbars(context: Context) {
     const isHovered = context.mouse.hovered.scrollbar === 'vertical'
 
     if (settings.showMinimap) {
+      const canvasDpr = Math.max(1, canvas.dpr.value)
+      const alignToDevicePixels = (value: number) => Math.round(value * canvasDpr) / canvasDpr
       c.fillStyle = getMinimapBackgroundCss(context, isHovered)
       c.fillRect(scrollbarX, layout.headerHeight, layout.verticalScrollbarSize, trackHeight)
       drawMinimapLeftShadow(c, scrollbarX, layout.headerHeight, trackHeight)
 
-      const minimapX = scrollbarX + MINIMAP_INNER_PADDING
-      const minimapY = layout.headerHeight + MINIMAP_INNER_PADDING
-      const minimapWidth = Math.max(1, layout.verticalScrollbarSize - MINIMAP_INNER_PADDING * 2)
-      const minimapHeight = Math.max(1, trackHeight - MINIMAP_INNER_PADDING * 2)
+      const minimapX = alignToDevicePixels(scrollbarX + MINIMAP_INNER_PADDING)
+      const minimapY = alignToDevicePixels(layout.headerHeight + MINIMAP_INNER_PADDING)
+      const minimapWidth = Math.max(1 / canvasDpr,
+        alignToDevicePixels(layout.verticalScrollbarSize - MINIMAP_INNER_PADDING * 2))
+      const minimapHeight = Math.max(1 / canvasDpr, alignToDevicePixels(trackHeight - MINIMAP_INNER_PADDING * 2))
       const lineCount = Math.max(1, context.doc.lines.length)
-      const geometry = computeMinimapGeometry(lineCount, minimapHeight, minimapWidth)
-
-      const drawHeight = Math.max(1, minimapHeight)
-      const sourceHeight = geometry.mode === 'windowed'
-        ? Math.max(1, Math.min(geometry.totalSourceRows, Math.round(drawHeight)))
-        : geometry.totalSourceRows
+      const minimapPixelScale = Math.max(1, canvasDpr)
+      const maxPixelRowScale = Math.max(1, Math.round(MINIMAP_BITMAP_ROW_SCALE * minimapPixelScale))
+      const maxTotalSourceRows = Math.max(1, Math.floor(MINIMAP_MAX_SURFACE_PIXELS / maxPixelRowScale))
+      const geometry = computeMinimapGeometry(lineCount, minimapHeight, minimapWidth, maxTotalSourceRows)
+      const pixelRowScale = Math.max(1, Math.round(geometry.rowScale * minimapPixelScale))
+      const targetDrawHeight = Math.max(1, Math.round(minimapHeight))
+      const sourceHeight = Math.max(
+        1,
+        Math.min(
+          geometry.totalSourceRows,
+          Math.round((targetDrawHeight * minimapPixelScale) / pixelRowScale),
+        ),
+      )
 
       const scrollRangeY = -layout.scrollHeight
       const scrollRatioY = scrollRangeY > 0 ? Math.max(0, Math.min(1, -liveScrollY / scrollRangeY)) : 0
       const maxSourceY = Math.max(0, geometry.totalSourceRows - sourceHeight)
-      const sourceY = geometry.mode === 'windowed'
-        ? Math.max(0, Math.min(maxSourceY, Math.round(scrollRatioY * maxSourceY)))
-        : 0
+      const sourceY = Math.max(0, Math.min(maxSourceY, Math.round(scrollRatioY * maxSourceY)))
 
-      const compression = buildCompressionState(lineCount, geometry, sourceHeight)
+      const compression = buildCompressionState(lineCount, geometry, sourceHeight, minimapPixelScale)
+      // Draw at the exact CSS size that maps to the source pixel crop to avoid stretch blits.
+      const drawWidth = Math.max(1, compression.pixelColumnCount / compression.pixelScale)
+      const drawHeight = Math.max(1, (sourceHeight * compression.pixelRowScale) / compression.pixelScale)
       const theme = getMinimapThemeSnapshot(context)
-      const contentKey = makeMinimapContentKey(context.doc.revision, context.doc.tokenVersion, theme.themeKey)
-      const burstMode = isMinimapBurstMode(context)
-
       const state = getMinimapRenderState(context)
+      const rawContentKey = makeMinimapContentKey(context.doc.tokenVersion, theme.themeKey)
+      const contentKey = (context.doc.tokenizationPending && state.renderContentKey)
+        ? state.renderContentKey
+        : rawContentKey
+      const burstMode = isMinimapBurstMode(context)
       if (!state.compression || state.compression.key !== compression.key) {
         resetCompressionState(state, compression)
       }
@@ -955,13 +1166,13 @@ export function drawScrollbars(context: Context) {
         sourceHeight,
         minimapX,
         minimapY,
-        minimapWidth,
+        drawWidth,
         drawHeight,
       )
 
       if (!drewCached) {
         c.fillStyle = 'rgba(255, 255, 255, 0.02)'
-        c.fillRect(minimapX, minimapY, minimapWidth, drawHeight)
+        c.fillRect(minimapX, minimapY, drawWidth, drawHeight)
       }
 
       c.fillStyle = isHovered ? MINIMAP_VIEWPORT_HOVER_COLOR : MINIMAP_VIEWPORT_COLOR

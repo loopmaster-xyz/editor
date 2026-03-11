@@ -96,8 +96,7 @@ function findNearestVisualLineAtWorldY(visualLines: VisualLine[], worldY: number
 function moveTokenPosition(tokenLines: Token[][], lineIndex: number, tokenIndex: number, delta: number): {
   lineIndex: number
   tokenIndex: number
-} | null
-{
+} | null {
   if (delta === 0) return { lineIndex, tokenIndex }
 
   let line = lineIndex
@@ -135,8 +134,7 @@ function findCallBlockTokenPositionFromAnchor(
   anchorTokenIndex: number,
   anchorToken: Token,
   targetToken: Token,
-): { lineIndex: number; tokenIndex: number } | null
-{
+): { lineIndex: number; tokenIndex: number } | null {
   const anchorBlockIndex = callBlock.indexOf(anchorToken)
   const targetBlockIndex = callBlock.indexOf(targetToken)
   if (anchorBlockIndex < 0 || targetBlockIndex < 0) return null
@@ -682,7 +680,10 @@ export function createMouse(
       if (!onMouseDown) continue
 
       const widgetColumn = widget.pos.x - 1
-      if (widgetColumn < lineStartColumn || widgetColumn > lineEndColumn) continue
+      const isRenderableOnLine = widget.type === 'before'
+        ? (widgetColumn >= lineStartColumn && widgetColumn < lineEndColumn)
+        : (widgetColumn > lineStartColumn && widgetColumn <= lineEndColumn)
+      if (!isRenderableOnLine) continue
 
       const widgetWorldX = widget.type === 'before'
         ? getXFromColumnUnclamped(lines, foundLine, widgetColumn, tokenLines, canvas, settings, caches)
@@ -704,12 +705,17 @@ export function createMouse(
     const inHeader = y >= 0 && y < headerHeight
     const gutterHit = hitTestGutter(canvas, settings, lines, scroll, gutter, x, y, headerHeight)
     const scrollbarHit = hitTestScrollbar(canvas, scroll, lines, settings, gutter, header, x, y)
+    const canHitWidget = y >= headerHeight && gutterHit.type === null && scrollbarHit.type === null
+    const widgetHover = canHitWidget && (findBelowWidgetHit(x, y) !== null || findBeforeAfterWidgetHit(x, y) !== null)
+
     canvas.el.style.cursor = gutterHit.type === 'collapse'
       ? 'pointer'
+      : widgetHover
+      ? 'default'
       : (y < 0 || inHeader || gutterHit.type !== null || scrollbarHit.type !== null || widgetPressed.value
           || headerPressed.value || scrollbars.isDragging.value)
-          ? 'default'
-          : 'text'
+      ? 'default'
+      : 'text'
   })
 
   effect(() => {
@@ -906,8 +912,8 @@ export function createMouse(
               if (parameterIndex >= 0) {
                 const paramStartToken = getParameterStartToken(callBlock, parameterIndex)
                 if (paramStartToken) {
-                  const pos = findCallBlockTokenPositionFromAnchor(tokenLines, callBlock, logicalLine, logicalTokenIndex,
-                    foundToken.token, paramStartToken)
+                  const pos = findCallBlockTokenPositionFromAnchor(tokenLines, callBlock, logicalLine,
+                    logicalTokenIndex, foundToken.token, paramStartToken)
                   if (pos) {
                     const lineTokens = tokenLines[pos.lineIndex] || []
                     const column = getColumnForTokenIndex(lineTokens, pos.tokenIndex)
@@ -944,11 +950,11 @@ export function createMouse(
                   if (functionPos) {
                     const functionLineTokens = tokenLines[functionPos.lineIndex] || []
                     const functionColumn = getColumnForTokenIndex(functionLineTokens, functionPos.tokenIndex)
-                    const functionLine = findVisualLineForColumn(lines, functionPos.lineIndex, functionColumn, tokenLines,
-                      caches)
+                    const functionLine = findVisualLineForColumn(lines, functionPos.lineIndex, functionColumn,
+                      tokenLines, caches)
                     if (functionLine) {
-                      const functionX = getXFromColumn(lines, functionLine, functionColumn, tokenLines, canvas, settings,
-                        caches)
+                      const functionX = getXFromColumn(lines, functionLine, functionColumn, tokenLines, canvas,
+                        settings, caches)
                       const functionContentY = functionLine.tokenOffset === 0
                         ? functionLine.y
                         : functionLine.y + getAboveHeightForLine(functionLine)

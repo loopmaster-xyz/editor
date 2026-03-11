@@ -21,8 +21,6 @@ interface OptimisticSnapshotCacheEntry {
   tokenVersion: number
   startLine: number
   endLine: number
-  cursorLine: number
-  cursorColumn: number
   snapshot: OptimisticViewportSnapshot
 }
 
@@ -231,11 +229,13 @@ export function drawBlocks(context: Context) {
   let optimisticSnapshot: OptimisticViewportSnapshot | null = null
   const now = Date.now()
   const inputAgeMs = now - caret.lastInputTime.value
+  const braceAnalysisCurrent = blocks.isBraceAnalysisCurrent()
   const shouldUseOptimistic = doc.keyHoldActive
-    || !blocks.isBraceAnalysisCurrent()
+    || !braceAnalysisCurrent
     || (caret.isTyping.value && inputAgeMs <= OPTIMISTIC_INPUT_WINDOW_MS)
+  const shouldBuildOptimisticSnapshot = shouldUseOptimistic || braceAnalysisCurrent
   const shouldBypassOptimisticCache = doc.keyHoldActive
-  if (shouldUseOptimistic) {
+  if (shouldBuildOptimisticSnapshot) {
     const optimisticStartLine = Math.max(0, firstVisibleLogicalLine - OPTIMISTIC_BRACE_MARGIN_LINES)
     const optimisticEndLine = Math.min(codeLines.length - 1, lastVisibleLogicalLine + OPTIMISTIC_BRACE_MARGIN_LINES)
     if (optimisticStartLine <= optimisticEndLine) {
@@ -247,8 +247,6 @@ export function drawBlocks(context: Context) {
         && cachedOptimistic.tokenVersion === doc.tokenVersion
         && cachedOptimistic.startLine === optimisticStartLine
         && cachedOptimistic.endLine === optimisticEndLine
-        && cachedOptimistic.cursorLine === caret.line.value
-        && cachedOptimistic.cursorColumn === caret.column.value
       ) {
         optimisticSnapshot = cachedOptimistic.snapshot
       }
@@ -263,8 +261,6 @@ export function drawBlocks(context: Context) {
           tokenVersion: doc.tokenVersion,
           startLine: optimisticStartLine,
           endLine: optimisticEndLine,
-          cursorLine: caret.line.value,
-          cursorColumn: caret.column.value,
           snapshot: optimisticSnapshot,
         })
       }
@@ -275,7 +271,7 @@ export function drawBlocks(context: Context) {
   const optimisticBlockEndsByStart = optimisticSnapshot?.blockEndsByStart ?? null
   const optimisticSortedStarts = optimisticSnapshot?.sortedStarts ?? []
   const optimisticParentByStart = optimisticSnapshot?.parentByStart ?? null
-  const useOptimisticTopology = optimisticSnapshot !== null
+  let useOptimisticTopology = shouldUseOptimistic && optimisticSnapshot !== null
 
   const matchingBrace = blocks.findMatchingBrace(caret.line.value, caret.column.value)
   const blockColors = settings.ui.blockColors
@@ -369,6 +365,75 @@ export function drawBlocks(context: Context) {
       current = optimisticParentByStart.get(current) ?? null
     }
     return null
+  }
+
+  const doesStableContainLine = (line: number, stableStart: number | null): boolean => {
+    if (stableStart === null) return false
+    const stableEnd = blocks.blockEnds.value.get(stableStart)
+    return stableEnd !== undefined && line >= stableStart && line <= stableEnd
+  }
+
+  const getStableBlockChain = (line: number): number[] => {
+    const chain: number[] = []
+    let current = blocks.findContainingBlockStart(line)
+    while (current !== null) {
+      chain.push(current)
+      current = blocks.getParentBlockStart(current)
+    }
+    return chain
+  }
+
+  const getOptimisticBlockChain = (line: number): number[] => {
+    const chain: number[] = []
+    if (!optimisticParentByStart) return chain
+    let current = findOptimisticContainingBlockStart(line)
+    while (current !== null) {
+      chain.push(current)
+      current = optimisticParentByStart.get(current) ?? null
+    }
+    return chain
+  }
+
+  const areBlockChainsEqual = (a: number[], b: number[]): boolean => {
+    if (a.length !== b.length) return false
+    for (let i = 0; i < a.length; i++) {
+      if (a[i] !== b[i]) return false
+    }
+    return true
+  }
+
+  if (!useOptimisticTopology && optimisticSnapshot) {
+    const stableContainingBlockAtCaret = blocks.findContainingBlockStart(caret.line.value)
+    const optimisticContainingBlockAtCaret = findOptimisticContainingBlockStart(caret.line.value)
+    if (
+      optimisticContainingBlockAtCaret !== null
+      && optimisticContainingBlockAtCaret !== stableContainingBlockAtCaret
+    ) {
+      useOptimisticTopology = true
+    }
+
+    if (!useOptimisticTopology) {
+      for (let i = 0; i < visibleLinesArray.length; i++) {
+        const line = visibleLinesArray[i]
+        const optimisticContainingBlock = findOptimisticContainingBlockStart(line)
+        if (optimisticContainingBlock === null) continue
+        const stableContainingBlock = blocks.findContainingBlockStart(line)
+        if (!doesStableContainLine(line, stableContainingBlock)) {
+          useOptimisticTopology = true
+          break
+        }
+        if (stableContainingBlock !== optimisticContainingBlock) {
+          useOptimisticTopology = true
+          break
+        }
+        const optimisticChain = getOptimisticBlockChain(line)
+        const stableChain = getStableBlockChain(line)
+        if (!areBlockChainsEqual(optimisticChain, stableChain)) {
+          useOptimisticTopology = true
+          break
+        }
+      }
+    }
   }
 
   const blocksToDraw = new Set<number>()
@@ -476,7 +541,12 @@ export function drawBlocks(context: Context) {
     const endVisualLine = lastVisibleVisualByLogicalLine.get(endLine)
       ?? (visualLinesByLogicalLine[endLine] ?? []).at(-1)
     if (!endVisualLine) return
-    const endY = textBottom(endVisualLine)
+    let endY = textBottom(endVisualLine)
+    if (endY <= startY) {
+      // Adjacent/open-empty-close blocks can resolve to zero-height ranges after reconciliation.
+      // Keep the last structural guide visible with a minimal segment instead of dropping it.
+      endY = startY + settings.lineHeight
+    }
 
     const startYCanvas = startY + scrollY
     const endYCanvas = endY + scrollY

@@ -49,6 +49,7 @@ export function createContext(editorSettings: Partial<EditorSettings>, doc: Doc,
   const lines = createLines(doc, canvas, metrics, settings, caches, blocks, header)
   const gutter = createGutter(doc, canvas, metrics, settings, caches, blocks, lines)
   const scroll = createScroll(canvas, lines, settings, gutter, header, metrics)
+  blocks.setScrollSource(scroll)
   const scrollbars = createScrollbars(canvas, scroll, lines, settings, gutter, header)
   const caret = createCaret(settings)
   const selection = createSelection()
@@ -73,6 +74,7 @@ export function createContext(editorSettings: Partial<EditorSettings>, doc: Doc,
   }
 
   const dispose = () => {
+    blocks.dispose()
     canvas.dispose()
     caches.dispose()
     keyboard.dispose()

@@ -282,8 +282,6 @@ export function createCaches(canvas: Canvas, settings: Settings, doc: Doc) {
   effect(() => {
     doc.widgets
     canvas.dpr.value
-    canvas.size.width.value
-    canvas.size.height.value
     settings.lineHeight
     settings.fontSize
     settings.theme

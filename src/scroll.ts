@@ -14,6 +14,12 @@ export const SCROLL_SMOOTH_THRESHOLD = 0.1
 
 export type Scroll = ReturnType<typeof createScroll>
 
+function clampScrollAxis(value: number, min: number, max: number): number {
+  if (value < min) return min
+  if (value > max) return max
+  return value
+}
+
 export function createScroll(canvas: Canvas, lines: Lines, settings: Settings, gutter: Gutter, header: Signal<Header>,
   metrics: Metrics)
 {
@@ -24,8 +30,28 @@ export function createScroll(canvas: Canvas, lines: Lines, settings: Settings, g
 
   const smooth = signal(0.2)
 
+  const clampScrollOffsets = () => {
+    const minX = scrollWidth.value
+    const minY = scrollHeight.value
+
+    if (Number.isFinite(targetX.value)) {
+      targetX.value = clampScrollAxis(targetX.value, minX, 0)
+    }
+    if (Number.isFinite(targetY.value)) {
+      targetY.value = clampScrollAxis(targetY.value, minY, 0)
+    }
+
+    if (Number.isFinite(pos.x)) {
+      pos.x = clampScrollAxis(pos.x, minX, 0)
+    }
+    if (Number.isFinite(pos.y)) {
+      pos.y = clampScrollAxis(pos.y, minY, 0)
+    }
+  }
+
   const update = () => {
     batch(() => {
+      clampScrollOffsets()
       const { x, y } = pos
       if (x === Infinity) {
         if (targetX.value === Infinity) {
@@ -44,6 +70,7 @@ export function createScroll(canvas: Canvas, lines: Lines, settings: Settings, g
         pos.x = targetX.value
         pos.y = targetY.value
       }
+      clampScrollOffsets()
     })
   }
 
@@ -113,44 +140,16 @@ export function createScroll(canvas: Canvas, lines: Lines, settings: Settings, g
   })
 
   effect(() => {
-    if (pos.x === Infinity || pos.y === Infinity) {
-      return
-    }
-
-    const approxContentMetrics = typeof lines.getApproxContentMetrics === 'function'
-      ? lines.getApproxContentMetrics()
-      : null
-    if (!approxContentMetrics) {
-      return
-    }
-
-    const headerHeight = header.value?.height ?? 0
-    const verticalScrollbarSize = getVerticalScrollbarSize(settings)
-    const needsVertical = approxContentMetrics.totalHeight
-      > canvas.size.height.value - headerHeight - settings.paddingTop - settings.paddingBottom
-      || settings.showMinimap
-    const availableWidth = canvas.size.width.value - settings.paddingLeft - settings.paddingRight - gutter.width.value
-      - (needsVertical ? verticalScrollbarSize : 0)
-    const minScrollX = settings.wordWrap ? 0 : Math.min(0, -approxContentMetrics.totalWidth + availableWidth)
-
-    const needsHorizontal = !settings.wordWrap && approxContentMetrics.totalWidth > availableWidth
-    const availableHeight = canvas.size.height.value - headerHeight - settings.paddingTop - settings.paddingBottom
-      - (needsHorizontal ? HORIZONTAL_SCROLLBAR_SIZE : 0)
-    const minScrollY = Math.min(0, -approxContentMetrics.totalHeight + availableHeight)
-
-    if (targetX.value < minScrollX) {
-      targetX.value = minScrollX
-    }
-    if (targetX.value > 0) {
-      targetX.value = 0
-    }
-
-    if (targetY.value < minScrollY) {
-      targetY.value = minScrollY
-    }
-    if (targetY.value > 0) {
-      targetY.value = 0
-    }
+    // Keep target and live position strictly inside current scroll bounds.
+    scrollWidth.value
+    scrollHeight.value
+    targetX.value
+    targetY.value
+    pos.x
+    pos.y
+    batch(() => {
+      clampScrollOffsets()
+    })
   })
 
   return { pos, targetX, targetY, smooth, scrollWidth, scrollHeight, update }

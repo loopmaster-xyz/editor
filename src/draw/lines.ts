@@ -34,8 +34,6 @@ function isBraceOrQuoteChar(char: string) {
 }
 
 const lastKnownBraceDepthByToken = new WeakMap<Token, Map<number, number>>()
-const lastKnownBraceDepthBySignature = new Map<string, number>()
-const MAX_BRACE_DEPTH_SIGNATURES = 20000
 const braceNullTraceLastLogAt = new Map<string, number>()
 const BRACE_NULL_TRACE_THROTTLE_MS = 150
 const lineHasBraceCandidatesCache = new WeakMap<VisualLine, boolean>()
@@ -43,6 +41,7 @@ const lineHasLigatureCandidatesCache = new WeakMap<VisualLine, boolean>()
 const IS_CHROME = navigator.userAgent.includes('Chrome')
 const RUN_CONTIGUOUS_EPSILON = 0.001
 const SCROLL_DIRECT_THRESHOLD_PX = 10
+const EMPTY_LOGICAL_LINE_TOKENS: Token[] = []
 
 function isOffscreen2DContext(
   c: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
@@ -71,29 +70,6 @@ function clearLastKnownBraceDepth(token: Token, charOffset: number) {
   if (!perChar) return
   perChar.delete(charOffset)
   if (perChar.size === 0) lastKnownBraceDepthByToken.delete(token)
-}
-
-function makeBraceDepthSignature(lineText: string, column: number, char: string): string {
-  return `${lineText}\u0000${column}\u0000${char}`
-}
-
-function getLastKnownBraceDepthBySignature(signature: string): number | null {
-  const depth = lastKnownBraceDepthBySignature.get(signature)
-  return depth === undefined ? null : depth
-}
-
-function setLastKnownBraceDepthBySignature(signature: string, depth: number) {
-  if (!lastKnownBraceDepthBySignature.has(signature)
-    && lastKnownBraceDepthBySignature.size >= MAX_BRACE_DEPTH_SIGNATURES)
-  {
-    const firstKey = lastKnownBraceDepthBySignature.keys().next().value
-    if (typeof firstKey === 'string') lastKnownBraceDepthBySignature.delete(firstKey)
-  }
-  lastKnownBraceDepthBySignature.set(signature, depth)
-}
-
-function clearLastKnownBraceDepthBySignature(signature: string) {
-  lastKnownBraceDepthBySignature.delete(signature)
 }
 
 function isBraceNullTraceEnabled(): boolean {
@@ -167,7 +143,7 @@ export function drawLine(
   const logicalLine = line.logicalLine
   const visualTokens = line.tokens
   const tokenLines = context.doc.tokenLines
-  const logicalLineTokens = tokenLines[logicalLine] || []
+  const logicalLineTokens = tokenLines[logicalLine] ?? EMPTY_LOGICAL_LINE_TOKENS
   const lineCacheKey = getLineCacheKey(context, line, logicalLineTokens)
   const lineCanvasSegmentKey = getLineCanvasSegmentKey(logicalLine, line.tokenOffset)
   const braceAnalysisVersion = context.blocks.getBraceAnalysisVersion()
@@ -293,7 +269,8 @@ export function drawLine(
       runText = token.text
     }
 
-    if (!hasBraceCandidates) {
+    const shouldApplyBraceColoring = hasBraceCandidates && braceAnalysisVersion >= 0
+    if (!shouldApplyBraceColoring) {
       for (let i = 0; i < visualTokens.length; i++) {
         const visualToken = visualTokens[i]
         drawRenderedToken(visualToken.token, visualToken.x, visualToken.tokenEndX)
@@ -302,10 +279,6 @@ export function drawLine(
       return
     }
 
-    let logicalLineText = ''
-    for (let i = 0; i < logicalLineTokens.length; i++) {
-      logicalLineText += logicalLineTokens[i]?.text ?? ''
-    }
     const blockColors = context.settings.ui.blockColors
     const tokenStartColumns = new Array<number>(logicalLineTokens.length + 1)
     tokenStartColumns[0] = 0
@@ -319,34 +292,6 @@ export function drawLine(
       return tokenStart + Math.max(0, charIndex)
     }
 
-    const getDepthFromMatchingBraceAtColumn = (column: number): number | null => {
-      const matchAfter = context.blocks.findMatchingBrace(logicalLine, column + 1)
-      if (matchAfter) {
-        if (matchAfter.line === logicalLine) {
-          const openColumn = getColumnFromTokenLocation(matchAfter.tokenIndex, matchAfter.charIndex)
-          if (openColumn === column) return matchAfter.depth
-        }
-        if (matchAfter.matchingLine === logicalLine) {
-          const closeColumn = getColumnFromTokenLocation(matchAfter.matchingTokenIndex, matchAfter.matchingCharIndex)
-          if (closeColumn === column) return matchAfter.depth
-        }
-      }
-
-      const matchAt = context.blocks.findMatchingBrace(logicalLine, column)
-      if (matchAt) {
-        if (matchAt.line === logicalLine) {
-          const openColumn = getColumnFromTokenLocation(matchAt.tokenIndex, matchAt.charIndex)
-          if (openColumn === column) return matchAt.depth
-        }
-        if (matchAt.matchingLine === logicalLine) {
-          const closeColumn = getColumnFromTokenLocation(matchAt.matchingTokenIndex, matchAt.matchingCharIndex)
-          if (closeColumn === column) return matchAt.depth
-        }
-      }
-
-      return null
-    }
-
     let tokenColumnStart = visualTokens.length > 0
       ? getColumnFromTokenLocation(visualTokens[0].logicalTokenIndex, visualTokens[0].logicalCharOffset)
       : 0
@@ -358,30 +303,20 @@ export function drawLine(
       const currentColumn = tokenColumnStart
 
       let colorOverride: string | undefined
-      if (logicalToken && logicalToken.type !== 'comment' && token.type !== 'comment' && token.text.length === 1) {
+      if (token.type !== 'comment' && token.text.length === 1) {
         const char = token.text
         if (isBraceOrQuoteChar(char)) {
           const depthToken = logicalToken ?? token
-          const signature = makeBraceDepthSignature(logicalLineText, currentColumn, char)
           let depth = context.blocks.getBraceDepthForPosition(logicalLine, logicalTokenIndex, logicalCharOffset)
-          if (depth === null && !isBraceAnalysisCurrent) {
-            depth = getDepthFromMatchingBraceAtColumn(currentColumn)
-          }
           if (depth === null && !isBraceAnalysisCurrent) {
             depth = getLastKnownBraceDepth(depthToken, logicalCharOffset)
           }
-          if (depth === null && !isBraceAnalysisCurrent) {
-            depth = getLastKnownBraceDepthBySignature(signature)
-          }
           if (depth !== null) {
             setLastKnownBraceDepth(depthToken, logicalCharOffset, depth)
-            setLastKnownBraceDepthBySignature(signature, depth)
             colorOverride = blockColors[depth % blockColors.length]
           }
           else if (isBraceAnalysisCurrent) {
             clearLastKnownBraceDepth(depthToken, logicalCharOffset)
-            clearLastKnownBraceDepthBySignature(signature)
-            colorOverride = 'red'
           }
 
           if (depth === null && !isBraceAnalysisCurrent && isBraceNullTraceEnabled()) {
@@ -451,6 +386,7 @@ export function drawLine(
     !needsRedraw
     && lineCanvas
     && hasBraceCandidates
+    && isBraceAnalysisCurrent
     && braceAnalysisVersion >= 0
     && (
       lineCanvas.braceAnalysisVersion !== braceAnalysisVersion

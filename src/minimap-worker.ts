@@ -7,7 +7,7 @@ import type {
 import type { Token, TokenType } from './token.ts'
 
 const MINIMAP_MAX_LINE_CHARS = 100
-const MINIMAP_PIXEL_ALPHA = 0.72
+const MINIMAP_PIXEL_ALPHA = 0.5
 const MINIMAP_TOKEN_TYPES: TokenType[] = [
   'keyword',
   'function',
@@ -22,6 +22,7 @@ const MINIMAP_TOKEN_TYPES: TokenType[] = [
   'text',
   'special',
 ]
+const themePaletteCache = new Map<string, Record<TokenType, Rgb>>()
 
 type Rgb = {
   r: number
@@ -85,13 +86,28 @@ function parseColorToRgb(color: string | undefined, fallback: Rgb): Rgb {
   return parsed ?? fallback
 }
 
+function getThemeCacheKey(theme: MinimapThemePayload): string {
+  const parts = new Array<string>(MINIMAP_TOKEN_TYPES.length + 1)
+  for (let i = 0; i < MINIMAP_TOKEN_TYPES.length; i++) {
+    const tokenType = MINIMAP_TOKEN_TYPES[i]
+    parts[i] = theme.byTokenType[tokenType] ?? ''
+  }
+  parts[MINIMAP_TOKEN_TYPES.length] = theme.textColor ?? ''
+  return parts.join('|')
+}
+
 function getTokenPalette(theme: MinimapThemePayload): Record<TokenType, Rgb> {
+  const cacheKey = getThemeCacheKey(theme)
+  const cached = themePaletteCache.get(cacheKey)
+  if (cached) return cached
+
   const palette = {} as Record<TokenType, Rgb>
   const fallback = parseColorToRgb(theme.textColor, { r: 255, g: 255, b: 255 })
   for (let i = 0; i < MINIMAP_TOKEN_TYPES.length; i++) {
     const tokenType = MINIMAP_TOKEN_TYPES[i]
     palette[tokenType] = parseColorToRgb(theme.byTokenType[tokenType], fallback)
   }
+  themePaletteCache.set(cacheKey, palette)
   return palette
 }
 
@@ -103,12 +119,12 @@ function isWhitespace(text: string): boolean {
   return true
 }
 
-function mapSpan(startChar: number, length: number, columnCount: number): [number, number] | null {
+function mapSpan(startChar: number, length: number, columnCount: number, columnScale: number): [number, number] | null {
   if (length <= 0) return null
   const start = Math.max(0, startChar)
   const end = Math.max(start + 1, start + length)
-  let colStart = Math.floor(start * columnCount / MINIMAP_MAX_LINE_CHARS)
-  let colEnd = Math.ceil(end * columnCount / MINIMAP_MAX_LINE_CHARS)
+  let colStart = Math.floor(start * columnScale)
+  let colEnd = Math.ceil(end * columnScale)
   if (colStart >= columnCount) return null
   if (colStart < 0) colStart = 0
   if (colEnd <= colStart) colEnd = colStart + 1
@@ -116,44 +132,7 @@ function mapSpan(startChar: number, length: number, columnCount: number): [numbe
   return [colStart, colEnd]
 }
 
-function drawFallbackRuns(
-  lineText: string,
-  rowHits: Uint8Array,
-  rowColorR: Uint16Array,
-  rowColorG: Uint16Array,
-  rowColorB: Uint16Array,
-  rowColorN: Uint8Array,
-  columnCount: number,
-  fallbackColor: Rgb,
-) {
-  if (lineText.length === 0) return
-  let runStart = -1
-  for (let i = 0; i <= lineText.length; i++) {
-    const atEnd = i >= lineText.length
-    const code = atEnd ? 32 : lineText.charCodeAt(i)
-    const isSpace = code <= 32
-    if (!isSpace && runStart < 0) {
-      runStart = i
-      continue
-    }
-    if (isSpace && runStart >= 0) {
-      const mapped = mapSpan(runStart, i - runStart, columnCount)
-      if (mapped) {
-        for (let col = mapped[0]; col < mapped[1]; col++) {
-          rowHits[col] = 1
-          rowColorR[col] += fallbackColor.r
-          rowColorG[col] += fallbackColor.g
-          rowColorB[col] += fallbackColor.b
-          rowColorN[col] = Math.min(255, rowColorN[col] + 1)
-        }
-      }
-      runStart = -1
-    }
-  }
-}
-
 function drawTokenLine(
-  lineText: string,
   lineTokens: Token[] | undefined,
   palette: Record<TokenType, Rgb>,
   rowHits: Uint8Array,
@@ -162,30 +141,26 @@ function drawTokenLine(
   rowColorB: Uint16Array,
   rowColorN: Uint8Array,
   columnCount: number,
+  columnScale: number,
 ) {
-  if (!lineTokens || lineTokens.length === 0) {
-    drawFallbackRuns(lineText, rowHits, rowColorR, rowColorG, rowColorB, rowColorN, columnCount, palette.text)
-    return
-  }
+  if (!lineTokens || lineTokens.length === 0) return
 
   let charCursor = 0
-  let aligned = true
   for (let tokenIndex = 0; tokenIndex < lineTokens.length; tokenIndex++) {
     const token = lineTokens[tokenIndex]
     const tokenText = token?.text ?? ''
     if (tokenText.length === 0) continue
 
     const start = charCursor
-    if (aligned) {
-      if (!lineText.startsWith(tokenText, charCursor)) aligned = false
-      else charCursor += tokenText.length
-    }
+    charCursor += tokenText.length
 
-    if (isWhitespace(tokenText)) continue
-    const mapped = mapSpan(start, tokenText.length, columnCount)
+    const tokenType = token?.type ?? 'text'
+    // Most non-text tokens are guaranteed visible; avoid scanning token text for whitespace.
+    if (tokenType === 'text' && isWhitespace(tokenText)) continue
+    const mapped = mapSpan(start, tokenText.length, columnCount, columnScale)
     if (!mapped) continue
 
-    const color = palette[token?.type ?? 'text'] ?? palette.text
+    const color = palette[tokenType] ?? palette.text
     for (let col = mapped[0]; col < mapped[1]; col++) {
       rowHits[col] = 1
       rowColorR[col] += color.r
@@ -193,10 +168,6 @@ function drawTokenLine(
       rowColorB[col] += color.b
       rowColorN[col] = Math.min(255, rowColorN[col] + 1)
     }
-  }
-
-  if (!aligned || charCursor !== lineText.length) {
-    drawFallbackRuns(lineText, rowHits, rowColorR, rowColorG, rowColorB, rowColorN, columnCount, palette.text)
   }
 }
 
@@ -218,6 +189,7 @@ function renderChunkBitmap(message: MinimapRenderChunkRequestMessage): { bitmap:
   const rowColorB = new Uint16Array(width)
   const rowColorN = new Uint8Array(width)
   const palette = getTokenPalette(message.theme)
+  const columnScale = width / MINIMAP_MAX_LINE_CHARS
   let hasInk = false
 
   for (let row = 0; row < message.rowCount; row++) {
@@ -228,10 +200,9 @@ function renderChunkBitmap(message: MinimapRenderChunkRequestMessage): { bitmap:
     rowColorN.fill(0)
 
     const lineStart = row * message.lineSpan
-    const lineEnd = Math.min(message.lines.length, lineStart + message.lineSpan)
+    const lineEnd = Math.min(message.tokenLines.length, lineStart + message.lineSpan)
     for (let lineIndex = lineStart; lineIndex < lineEnd; lineIndex++) {
       drawTokenLine(
-        message.lines[lineIndex] ?? '',
         message.tokenLines[lineIndex],
         palette,
         rowHits,
@@ -240,6 +211,7 @@ function renderChunkBitmap(message: MinimapRenderChunkRequestMessage): { bitmap:
         rowColorB,
         rowColorN,
         width,
+        columnScale,
       )
     }
 
@@ -298,7 +270,8 @@ self.onmessage = (event: MessageEvent<MinimapWorkerRequestMessage>) => {
       hasInk: rendered.hasInk,
       bitmap: rendered.bitmap,
     }
-    self.postMessage(response, [response.bitmap as unknown as Transferable])
+    // @ts-ignore
+    self.postMessage(response, [response.bitmap])
   }
   catch (error) {
     postError(message.requestId, message.contextId, error)

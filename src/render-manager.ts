@@ -99,7 +99,13 @@ function drawContext(context: Context, overlayCanvas: ReturnType<typeof createOv
   drawGutter(context)
   canvas.c.restore()
   canvas.c.restore()
-  drawScrollbars(context)
+  try {
+    drawScrollbars(context)
+  }
+  catch (error) {
+    console.error('[editor:render] drawScrollbars failed', error)
+    context.settings.showMinimap = false
+  }
   drawHeader(context)
 
   const currentlyActive = activeTooltip.get(context) || null
@@ -225,7 +231,12 @@ class RenderManager {
     this.overlayCanvas.clear()
 
     for (const context of this.contexts) {
-      drawContext(context, this.overlayCanvas, this.activeTooltip, this.viewport)
+      try {
+        drawContext(context, this.overlayCanvas, this.activeTooltip, this.viewport)
+      }
+      catch (error) {
+        console.error('[editor:render] drawContext failed', error)
+      }
     }
   }
 }

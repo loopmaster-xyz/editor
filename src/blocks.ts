@@ -2,6 +2,7 @@ import { computed, effect, signal } from '@preact/signals-core'
 import braceWorkerUrl from './brace-worker.ts?worker&url'
 import type { Caches } from './caches.ts'
 import type { Doc } from './doc.ts'
+import type { Scroll } from './scroll.ts'
 import type { Token } from './token.ts'
 
 export type Blocks = ReturnType<typeof createBlocks>
@@ -92,6 +93,9 @@ function getBraceCacheRebuildDebounceMs(lineCount: number): number {
   if (lineCount >= 20_000) return 280
   return 180
 }
+
+const BRACE_REBUILD_SCROLL_SETTLE_MS = 110
+const BRACE_REBUILD_SCROLL_EPSILON = 0.35
 
 const EMPTY_BRACE_CACHE: BraceCache = {
   braces: [],
@@ -924,6 +928,9 @@ export function createBlocks(doc: Doc, caches: Caches) {
   let braceWorkerJobId = 0
   let activeBraceWorkerJob: { jobId: number; tokenVersion: number } | null = null
   let queuedBraceWorkerTokenVersion: number | null = null
+  let braceWorkerFlushTimer: ReturnType<typeof setTimeout> | null = null
+  let lastScrollActivityAt = 0
+  let disposeScrollActivityObserver: (() => void) | null = null
   const debouncedBraceTokenVersion = signal(-1)
   const pendingLineTransforms: LineTransform[] = []
   let pendingLineTransformsVersion = 0
@@ -976,9 +983,25 @@ export function createBlocks(doc: Doc, caches: Caches) {
       && doc.lines.length >= 20_000
   }
 
+  const scheduleQueuedBraceWorkerFlush = (delayMs = BRACE_REBUILD_SCROLL_SETTLE_MS) => {
+    if (braceWorkerFlushTimer !== null) clearTimeout(braceWorkerFlushTimer)
+    braceWorkerFlushTimer = setTimeout(() => {
+      braceWorkerFlushTimer = null
+      flushQueuedBraceWorkerRebuild()
+    }, Math.max(0, delayMs))
+  }
+
+  const isScrollSettling = () => {
+    return Date.now() - lastScrollActivityAt < BRACE_REBUILD_SCROLL_SETTLE_MS
+  }
+
   const flushQueuedBraceWorkerRebuild = () => {
     if (queuedBraceWorkerTokenVersion === null) return
     if (activeBraceWorkerJob) return
+    if (isScrollSettling()) {
+      scheduleQueuedBraceWorkerFlush()
+      return
+    }
     const nextTokenVersion = queuedBraceWorkerTokenVersion
     queuedBraceWorkerTokenVersion = null
     if (doc.tokenVersion !== nextTokenVersion) return
@@ -996,6 +1019,58 @@ export function createBlocks(doc: Doc, caches: Caches) {
       tokenLines: doc.tokenLines,
     }
     worker.postMessage(message)
+  }
+
+  const setScrollSource = (scroll: Scroll | null) => {
+    if (disposeScrollActivityObserver) {
+      disposeScrollActivityObserver()
+      disposeScrollActivityObserver = null
+    }
+    if (!scroll) return
+
+    let lastPosX = Number.NaN
+    let lastPosY = Number.NaN
+    let lastTargetX = Number.NaN
+    let lastTargetY = Number.NaN
+
+    disposeScrollActivityObserver = effect(() => {
+      const posX = scroll.pos.x
+      const posY = scroll.pos.y
+      const targetX = scroll.targetX.value
+      const targetY = scroll.targetY.value
+
+      const hasFinitePos = Number.isFinite(posX) && Number.isFinite(posY)
+      const hasFiniteTarget = Number.isFinite(targetX) && Number.isFinite(targetY)
+      const targetOffsetChanged = hasFiniteTarget
+        && (
+          Math.abs(targetX - posX) > BRACE_REBUILD_SCROLL_EPSILON
+          || Math.abs(targetY - posY) > BRACE_REBUILD_SCROLL_EPSILON
+        )
+      const posChanged = Number.isFinite(lastPosX) && Number.isFinite(lastPosY)
+        ? (
+            Math.abs(posX - lastPosX) > BRACE_REBUILD_SCROLL_EPSILON
+            || Math.abs(posY - lastPosY) > BRACE_REBUILD_SCROLL_EPSILON
+          )
+        : hasFinitePos
+      const targetChanged = Number.isFinite(lastTargetX) && Number.isFinite(lastTargetY)
+        ? (
+            Math.abs(targetX - lastTargetX) > BRACE_REBUILD_SCROLL_EPSILON
+            || Math.abs(targetY - lastTargetY) > BRACE_REBUILD_SCROLL_EPSILON
+          )
+        : hasFiniteTarget
+
+      if (targetOffsetChanged || posChanged || targetChanged) {
+        lastScrollActivityAt = Date.now()
+        if (queuedBraceWorkerTokenVersion !== null && !activeBraceWorkerJob) {
+          scheduleQueuedBraceWorkerFlush()
+        }
+      }
+
+      lastPosX = posX
+      lastPosY = posY
+      lastTargetX = targetX
+      lastTargetY = targetY
+    })
   }
 
   const ensureBraceWorker = () => {
@@ -1180,6 +1255,10 @@ export function createBlocks(doc: Doc, caches: Caches) {
         clearTimeout(braceRebuildTimer)
         braceRebuildTimer = null
       }
+      if (braceWorkerFlushTimer !== null) {
+        clearTimeout(braceWorkerFlushTimer)
+        braceWorkerFlushTimer = null
+      }
       activeBraceWorkerJob = null
       queuedBraceWorkerTokenVersion = null
       const tokenVersion = doc.tokenVersion
@@ -1229,7 +1308,7 @@ export function createBlocks(doc: Doc, caches: Caches) {
 
   effect(() => {
     const tokenVersion = doc.tokenVersion
-    doc.tokenizationPending
+    const tokenizationPending = doc.tokenizationPending
     const keyHoldActive = doc.keyHoldActive
 
     if (lastStableBraceTokenVersion === tokenVersion) {
@@ -1242,6 +1321,16 @@ export function createBlocks(doc: Doc, caches: Caches) {
 
     // Never start debounce while a key is held; wait for keyup idle.
     if (keyHoldActive) {
+      if (braceRebuildTimer !== null) {
+        clearTimeout(braceRebuildTimer)
+        braceRebuildTimer = null
+      }
+      return
+    }
+
+    // Rebuilding from transient/incomplete token snapshots causes brace color churn.
+    // Wait for tokenization to settle, stale mapping handles interim rendering.
+    if (tokenizationPending) {
       if (braceRebuildTimer !== null) {
         clearTimeout(braceRebuildTimer)
         braceRebuildTimer = null
@@ -1383,6 +1472,32 @@ export function createBlocks(doc: Doc, caches: Caches) {
     return doc.collapsed.has(line)
   }
 
+  const computeMaxCollapsedLine = (collapsed: Set<number>) => {
+    let maxLine = -1
+    for (const line of collapsed) {
+      if (line > maxLine) maxLine = line
+    }
+    return maxLine
+  }
+
+  let collapsedRef = doc.collapsed
+  let collapsedMaxLine = computeMaxCollapsedLine(collapsedRef)
+
+  const syncCollapsedMeta = () => {
+    const collapsed = doc.collapsed
+    if (collapsed !== collapsedRef) {
+      collapsedRef = collapsed
+      collapsedMaxLine = computeMaxCollapsedLine(collapsed)
+    }
+    return collapsed
+  }
+
+  const assignCollapsed = (nextCollapsed: Set<number>, nextMaxLine: number) => {
+    doc.collapsed = nextCollapsed
+    collapsedRef = nextCollapsed
+    collapsedMaxLine = nextMaxLine
+  }
+
   const findNearestBlockStartAtOrBefore = (line: number): number | null => {
     if (line < 0 || line >= doc.lines.length) return null
 
@@ -1445,22 +1560,27 @@ export function createBlocks(doc: Doc, caches: Caches) {
   }
 
   const adjustOnLineInsert = (insertedAt: number) => {
+    const collapsed = syncCollapsedMeta()
+    if (collapsed.size === 0) return
+    if (collapsedMaxLine < insertedAt) return
+
     const newCollapsed = new Set<number>()
-    for (const line of doc.collapsed) {
-      if (line >= insertedAt) {
-        newCollapsed.add(line + 1)
-      }
-      else {
-        newCollapsed.add(line)
-      }
+    for (const line of collapsed) {
+      if (line >= insertedAt) newCollapsed.add(line + 1)
+      else newCollapsed.add(line)
     }
-    doc.collapsed = newCollapsed
+    assignCollapsed(newCollapsed, collapsedMaxLine + 1)
   }
 
   const adjustOnLineInsertRange = (startLine: number, endLine: number) => {
+    const collapsed = syncCollapsedMeta()
+    if (collapsed.size === 0) return
     const insertedCount = endLine - startLine + 1
+    if (insertedCount <= 0) return
+    if (collapsedMaxLine < startLine) return
+
     const newCollapsed = new Set<number>()
-    for (const line of doc.collapsed) {
+    for (const line of collapsed) {
       if (line >= startLine) {
         newCollapsed.add(line + insertedCount)
       }
@@ -1468,7 +1588,7 @@ export function createBlocks(doc: Doc, caches: Caches) {
         newCollapsed.add(line)
       }
     }
-    doc.collapsed = newCollapsed
+    assignCollapsed(newCollapsed, collapsedMaxLine + insertedCount)
   }
 
   const adjustOnLineDelete = (deletedAt: number) => {
@@ -1522,36 +1642,17 @@ export function createBlocks(doc: Doc, caches: Caches) {
     }
 
     if (doc.tokenizationPending) {
-      return getSameLineBraceDepthForPosition(doc.tokenLines, line, tokenIndex, charIndex)
+      // Keep using shifted stable data while token snapshots are incomplete.
+      // Per-line fallback matching here causes depth jitter during rapid edits.
+      return null
     }
 
     if (lastStableBraceTokenVersion < 0) return null
 
     if (lastStableBraceTokenVersion !== doc.tokenVersion) {
-      const column = getColumnFromTokenLocation(doc.tokenLines, line, tokenIndex, charIndex)
-      const fromMatchAfter = findMatchingBrace(line, column + 1)
-      if (fromMatchAfter) {
-        const isOpen = fromMatchAfter.line === line
-          && fromMatchAfter.tokenIndex === tokenIndex
-          && fromMatchAfter.charIndex === charIndex
-        const isClose = fromMatchAfter.matchingLine === line
-          && fromMatchAfter.matchingTokenIndex === tokenIndex
-          && fromMatchAfter.matchingCharIndex === charIndex
-        if (isOpen || isClose) return fromMatchAfter.depth
-      }
-
-      const fromMatchAt = findMatchingBrace(line, column)
-      if (fromMatchAt) {
-        const isOpen = fromMatchAt.line === line
-          && fromMatchAt.tokenIndex === tokenIndex
-          && fromMatchAt.charIndex === charIndex
-        const isClose = fromMatchAt.matchingLine === line
-          && fromMatchAt.matchingTokenIndex === tokenIndex
-          && fromMatchAt.matchingCharIndex === charIndex
-        if (isOpen || isClose) return fromMatchAt.depth
-      }
-
-      return getSameLineBraceDepthForPosition(doc.tokenLines, line, tokenIndex, charIndex)
+      // While analysis is stale we only use shifted stable mappings above.
+      // Avoid recomputing live matches against in-flight token snapshots.
+      return null
     }
 
     return null
@@ -1740,6 +1841,27 @@ export function createBlocks(doc: Doc, caches: Caches) {
     return lastStableBraceTokenVersion
   }
 
+  const dispose = () => {
+    if (braceRebuildTimer !== null) {
+      clearTimeout(braceRebuildTimer)
+      braceRebuildTimer = null
+    }
+    if (braceWorkerFlushTimer !== null) {
+      clearTimeout(braceWorkerFlushTimer)
+      braceWorkerFlushTimer = null
+    }
+    if (disposeScrollActivityObserver) {
+      disposeScrollActivityObserver()
+      disposeScrollActivityObserver = null
+    }
+    activeBraceWorkerJob = null
+    queuedBraceWorkerTokenVersion = null
+    if (braceWorker) {
+      braceWorker.terminate()
+      braceWorker = null
+    }
+  }
+
   return {
     blockStarts,
     blockEnds,
@@ -1761,6 +1883,8 @@ export function createBlocks(doc: Doc, caches: Caches) {
     getBraceDepthForLine,
     isBraceAnalysisCurrent,
     getBraceAnalysisVersion,
+    setScrollSource,
     debugBraceProbe,
+    dispose,
   }
 }

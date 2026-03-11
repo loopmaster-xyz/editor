@@ -19,7 +19,6 @@ export type MinimapRenderChunkRequestMessage = {
   lineSpan: number
   columnCount: number
   rowScale: number
-  lines: string[]
   tokenLines: Token[][]
   theme: MinimapThemePayload
 }

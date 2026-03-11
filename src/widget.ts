@@ -55,9 +55,17 @@ export type Widget = {
 }
 
 export function adjustWidgetsOnLineSplit(doc: Doc, line: number, column: number, delta: number) {
+  if (delta === 0) return
+
   const widgetLine = line + 1
   const widgetColumn = column + 1
-  for (const widget of doc.widgets) {
+
+  const widgets = doc.widgets
+  const errors = doc.errors
+  if (widgets.length === 0 && errors.length === 0) return
+
+  for (let i = 0; i < widgets.length; i++) {
+    const widget = widgets[i]
     if (widget.pos.y === widgetLine) {
       let shouldMove = false
 
@@ -92,18 +100,56 @@ export function adjustWidgetsOnLineSplit(doc: Doc, line: number, column: number,
     }
   }
 
-  doc.errors = doc.errors.map(error =>
-    adjustError(error, (x, y) => {
-      if (y === line + 1) {
-        const [startColumn, endColumn] = [x[0] - 1, x[1] - 1]
-        if (startColumn >= column) return { x: [startColumn - column + 1, endColumn - column + 1], y: y + delta }
-        if (endColumn >= column) return { x: [x[0], column + 1], y }
-        return null
+  if (errors.length === 0) return
+  let nextErrors: DocError[] | null = null
+  for (let i = 0; i < errors.length; i++) {
+    const error = errors[i]
+    if (isDerivedError(error)) continue
+
+    let nextY = error.y
+    let nextXStart = error.x[0]
+    let nextXEnd = error.x[1]
+
+    if (nextY === widgetLine) {
+      const startColumn = nextXStart - 1
+      const endColumn = nextXEnd - 1
+      if (startColumn >= column) {
+        nextY += delta
+        nextXStart = startColumn - column + 1
+        nextXEnd = endColumn - column + 1
       }
-      if (y > line + 1) return { x, y: y + delta }
-      return null
-    })
-  )
+      else if (endColumn >= column) {
+        nextXEnd = column + 1
+      }
+      else {
+        continue
+      }
+    }
+    else if (nextY > widgetLine) {
+      nextY += delta
+    }
+    else {
+      continue
+    }
+
+    if (
+      nextY === error.y
+      && nextXStart === error.x[0]
+      && nextXEnd === error.x[1]
+    ) {
+      continue
+    }
+
+    if (!nextErrors) nextErrors = errors.slice()
+    nextErrors[i] = {
+      ...error,
+      x: [nextXStart, nextXEnd],
+      y: nextY,
+    }
+  }
+
+  if (!nextErrors) return
+  doc.errors = nextErrors
 }
 
 export function adjustWidgetsOnLineMerge(doc: Doc, line: number, prevLineLength: number) {
