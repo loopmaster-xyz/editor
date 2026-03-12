@@ -347,7 +347,9 @@ export function drawLine(
   const shouldUseDirectDraw = directDraw
   if (shouldUseDirectDraw) {
     drawLineDecorations()
+    c.save()
     renderLineTokens(c, contentY + 2, false)
+    c.restore()
     return
   }
 

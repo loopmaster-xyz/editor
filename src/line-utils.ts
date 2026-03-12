@@ -45,14 +45,20 @@ export function findVisualLineForColumn(
   caches: Caches,
 ): VisualLine | null {
   const cacheKey = `${logicalLine}:${column}`
-  const cached = caches.findVisualLineForColumnCache.get(cacheKey)
-  if (cached !== undefined) {
-    return cached
-  }
-
   const visualLinesByLogicalLine = lines.visualLinesByLogicalLine.value
   const relevantLines = visualLinesByLogicalLine[logicalLine] ?? []
+  const cached = caches.findVisualLineForColumnCache.get(cacheKey)
+  if (cached !== undefined) {
+    // Visual line objects are recreated as wrapping/layout changes. Guard against stale
+    // cached references that no longer exist in the current logical-line slice.
+    if (cached === null || relevantLines.includes(cached)) {
+      return cached
+    }
+    caches.findVisualLineForColumnCache.delete(cacheKey)
+  }
+
   if (relevantLines.length === 0) {
+    caches.findVisualLineForColumnCache.set(cacheKey, null)
     return null
   }
 

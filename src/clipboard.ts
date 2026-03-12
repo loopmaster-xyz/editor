@@ -468,7 +468,12 @@ export function createClipboard(
     flushChunkedPasteImmediately()
     endChunkedPasteSession()
     clearDeferredCaretVisible()
-    setActiveClipboard(null, undefined)
+    // When no editor is active, release the hidden textarea focus so page-level
+    // navigation keys (e.g. PageUp/PageDown) go back to the document.
+    setActiveClipboard(null, null)
+    if (document.activeElement === textarea) {
+      textarea.blur()
+    }
   }
 
   const dispose = () => {
