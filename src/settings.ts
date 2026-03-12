@@ -101,6 +101,7 @@ const defaultSettings = {
   minGutterDigits: 2,
   showGutter: true,
   showMinimap: false,
+  overscroll: false,
   performanceMode: 'normal' as 'normal' | 'large' | 'stress',
 }
 

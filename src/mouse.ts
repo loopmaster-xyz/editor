@@ -6,7 +6,7 @@ import type { Canvas } from './canvas.ts'
 import type { Caret } from './caret.ts'
 import type { Doc, DocError } from './doc.ts'
 import { hitTestGutter } from './draw/gutter.ts'
-import { hitTestScrollbar } from './draw/scrollbar.ts'
+import { getVerticalScrollbarSize, hitTestScrollbar } from './draw/scrollbar.ts'
 import type { Gutter } from './gutter.ts'
 import type { Header } from './header.ts'
 import { signalify } from './lib/signalify.ts'
@@ -1085,7 +1085,7 @@ export function createMouse(
     prevMouseX = pos.x
     prevMouseY = pos.y
 
-    const maxScrollY = -(lines.totalHeight.value - canvasHeight)
+    const maxScrollY = scroll.scrollHeight.value
     const maxScrollX = settings.wordWrap ? 0 : -(lines.totalWidth.value - canvasWidth)
     const canScrollUp = scroll.targetY.value < 0
     const canScrollDown = scroll.targetY.value > maxScrollY
@@ -1148,11 +1148,9 @@ export function createMouse(
     stopAutoScroll()
     currentAutoScrollDirection = direction
     autoScrollInterval = setInterval(() => {
-      const headerHeight = header.value?.height ?? 0
-      const canvasHeight = canvas.size.height.value - headerHeight - settings.paddingTop - settings.paddingBottom
       const canvasWidth = canvas.size.width.value - settings.paddingLeft - settings.paddingRight
 
-      const maxScrollY = -(lines.totalHeight.value - canvasHeight)
+      const maxScrollY = scroll.scrollHeight.value
       const maxScrollX = settings.wordWrap ? 0 : -(lines.totalWidth.value - canvasWidth)
 
       if (direction === 'up') {
@@ -1542,7 +1540,11 @@ export function createMouse(
     escapePressed = false
 
     const headerHeight = header.value?.height ?? 0
-    const inHeader = headerHeight > 0 && pos.y >= 0 && pos.y < headerHeight
+    const headerWidth = Math.max(
+      0,
+      canvas.size.width.value - (settings.showMinimap ? getVerticalScrollbarSize(settings) : 0),
+    )
+    const inHeader = headerHeight > 0 && pos.y >= 0 && pos.y < headerHeight && pos.x < headerWidth
     const headerValue = header.value
     const onMouseDown = headerValue?.onMouseDown
     if (inHeader && onMouseDown) {
@@ -1552,10 +1554,10 @@ export function createMouse(
         window.removeEventListener('mouseup', onHeaderMouseUp)
       }
       window.addEventListener('mouseup', onHeaderMouseUp)
-      const w = canvas.size.width.value
+      const w = headerWidth
       const h = headerValue.height
       const tx = gutter.width.value
-      const tw = w - tx
+      const tw = Math.max(0, w - tx)
       onMouseDown(event, pos.x, pos.y, w, h, tx, tw)
       event.preventDefault()
       caret.suppressAutoScroll = false
@@ -1756,10 +1758,9 @@ export function createMouse(
     lastTouchClientY = clientY
 
     const headerHeight = header.value?.height ?? 0
-    const canvasHeight = canvas.size.height.value - headerHeight - settings.paddingTop - settings.paddingBottom
     const canvasWidth = canvas.size.width.value - settings.paddingLeft - settings.paddingRight
 
-    const maxScrollY = -(lines.totalHeight.value - canvasHeight)
+    const maxScrollY = scroll.scrollHeight.value
     const maxScrollX = settings.wordWrap ? 0 : -(lines.totalWidth.value - canvasWidth)
 
     const atEdgeY = (deltaY < 0 && scroll.targetY.value <= maxScrollY) || (deltaY > 0 && scroll.targetY.value >= 0)

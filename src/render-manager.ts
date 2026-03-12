@@ -99,6 +99,7 @@ function drawContext(context: Context, overlayCanvas: ReturnType<typeof createOv
   drawGutter(context)
   canvas.c.restore()
   canvas.c.restore()
+  drawHeader(context)
   try {
     drawScrollbars(context)
   }
@@ -106,7 +107,6 @@ function drawContext(context: Context, overlayCanvas: ReturnType<typeof createOv
     console.error('[editor:render] drawScrollbars failed', error)
     context.settings.showMinimap = false
   }
-  drawHeader(context)
 
   const currentlyActive = activeTooltip.get(context) || null
   const hoverToken = context.mouse.hovered.hoverToken

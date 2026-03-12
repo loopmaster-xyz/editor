@@ -1119,8 +1119,8 @@ function getVerticalThumbMetrics(
   canvasDpr = 1,
 ) {
   const scrollbarX = layout.width - layout.verticalScrollbarSize
-  const trackY = layout.headerHeight
-  const trackHeight = layout.height - layout.headerHeight
+  const trackY = layout.verticalScrollbarSize === MINIMAP_SCROLLBAR_SIZE ? 0 : layout.headerHeight
+  const trackHeight = layout.height - trackY
   let thumbTrackHeight = trackHeight
 
   if (layout.verticalScrollbarSize === MINIMAP_SCROLLBAR_SIZE) {
@@ -1133,13 +1133,13 @@ function getVerticalThumbMetrics(
     )
   }
 
+  const scrollRange = Math.max(0, -layout.scrollHeight)
   const thumbHeightUnclamped = Math.max(
     SCROLLBAR_MIN_THUMB,
     (layout.availableHeight / layout.totalHeight) * thumbTrackHeight,
   )
   const thumbHeight = Math.min(thumbTrackHeight, thumbHeightUnclamped)
   const trackLength = Math.max(0, thumbTrackHeight - thumbHeight)
-  const scrollRange = -layout.scrollHeight
   const scrollRatio = scrollRange > 0 ? Math.max(0, Math.min(1, -scrollY / scrollRange)) : 0
   const thumbY = trackY + scrollRatio * trackLength
 
@@ -1240,9 +1240,11 @@ export function drawScrollbars(context: Context) {
   const layout = getScrollbarLayout(canvas, scroll, lines, settings, gutter, header)
 
   if (layout.needsVertical) {
-    const liveScrollY = context.scrollbars.isDragging.value
+    const liveScrollY = settings.showMinimap
       ? layout.scrollY
-      : (scroll.pos.y === Infinity ? layout.scrollY : scroll.pos.y)
+      : (context.scrollbars.isDragging.value
+          ? layout.scrollY
+          : (scroll.pos.y === Infinity ? layout.scrollY : scroll.pos.y))
     const { scrollbarX, trackY, trackHeight, thumbHeight, thumbY } = getVerticalThumbMetrics(
       layout,
       liveScrollY,
@@ -1254,10 +1256,10 @@ export function drawScrollbars(context: Context) {
     if (settings.showMinimap) {
       const canvasDpr = Math.max(1, canvas.dpr.value)
       const alignToDevicePixels = (value: number) => Math.round(value * canvasDpr) / canvasDpr
-      const fullTrackHeight = layout.height - layout.headerHeight
+      const fullTrackHeight = trackHeight
       c.fillStyle = getMinimapBackgroundCss(context, isHovered)
-      c.fillRect(scrollbarX, layout.headerHeight, layout.verticalScrollbarSize, fullTrackHeight)
-      drawMinimapLeftShadow(c, scrollbarX, layout.headerHeight, fullTrackHeight)
+      c.fillRect(scrollbarX, trackY, layout.verticalScrollbarSize, fullTrackHeight)
+      drawMinimapLeftShadow(c, scrollbarX, trackY, fullTrackHeight)
 
       const lineCount = Math.max(1, context.doc.lines.length)
       const minimapMetrics = getMinimapViewportMetrics(
@@ -1270,8 +1272,12 @@ export function drawScrollbars(context: Context) {
       const minimapY = alignToDevicePixels(trackY + MINIMAP_INNER_PADDING)
       const { geometry, sourceHeight, drawHeight, minimapPixelScale } = minimapMetrics
 
-      const scrollRangeY = -layout.scrollHeight
-      const scrollRatioY = scrollRangeY > 0 ? Math.max(0, Math.min(1, -liveScrollY / scrollRangeY)) : 0
+      const fullScrollRangeY = Math.max(0, -layout.scrollHeight)
+      const contentScrollRangeY = Math.max(0, layout.totalHeight - layout.availableHeight)
+      const scrollOffsetY = Math.max(0, Math.min(fullScrollRangeY, -liveScrollY))
+      // Overscroll is blank space after the real content; keep the minimap content pinned at EOF.
+      const contentScrollOffsetY = Math.min(scrollOffsetY, contentScrollRangeY)
+      const scrollRatioY = contentScrollRangeY > 0 ? contentScrollOffsetY / contentScrollRangeY : 0
       const maxSourceY = Math.max(0, geometry.totalSourceRows - sourceHeight)
       const sourceY = Math.max(0, Math.min(maxSourceY, Math.round(scrollRatioY * maxSourceY)))
 
@@ -1308,8 +1314,13 @@ export function drawScrollbars(context: Context) {
         c.fillRect(minimapX, minimapY, drawWidth, drawHeight)
       }
 
+      const viewportHeight = Math.max(1, (layout.availableHeight / Math.max(1, layout.totalHeight)) * drawHeight)
+      const viewportTrackLength = Math.max(0, drawHeight - viewportHeight)
+      const viewportScrollRatioY = contentScrollRangeY > 0 ? scrollOffsetY / contentScrollRangeY : 0
+      const viewportY = minimapY + viewportScrollRatioY * viewportTrackLength
+
       c.fillStyle = isHovered ? MINIMAP_VIEWPORT_HOVER_COLOR : MINIMAP_VIEWPORT_COLOR
-      c.fillRect(scrollbarX + 1, thumbY, Math.max(1, layout.verticalScrollbarSize - 2), thumbHeight)
+      c.fillRect(scrollbarX + 1, viewportY, Math.max(1, layout.verticalScrollbarSize - 2), viewportHeight)
     }
     else {
       c.strokeStyle = SCROLLBAR_TRACK_COLOR

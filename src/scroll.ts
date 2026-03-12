@@ -96,7 +96,10 @@ export function createScroll(canvas: Canvas, lines: Lines, settings: Settings, g
     const needsHorizontal = !settings.wordWrap && lines.totalWidth.value > availableWidth
     const availableHeight = canvas.size.height.value - headerHeight - settings.paddingTop - settings.paddingBottom
       - (needsHorizontal ? HORIZONTAL_SCROLLBAR_SIZE : 0)
-    return Math.min(0, -lines.totalHeight.value + availableHeight)
+    const baseMinY = Math.min(0, -lines.totalHeight.value + availableHeight)
+    if (!settings.overscroll) return baseMinY
+    const overscrollMinY = Math.min(0, -lines.totalHeight.value + settings.lineHeight)
+    return Math.min(baseMinY, overscrollMinY)
   })
 
   effect(() => {
