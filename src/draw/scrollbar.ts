@@ -28,7 +28,8 @@ const SCROLLBAR_THUMB_HOVER_COLOR = 'rgba(255, 255, 255, 0.2)'
 
 const MINIMAP_VIEWPORT_COLOR = 'rgba(255, 255, 255, 0.08)'
 const MINIMAP_VIEWPORT_HOVER_COLOR = 'rgba(255, 255, 255, 0.14)'
-const MINIMAP_INNER_PADDING = 4
+const MINIMAP_INNER_PADDING_X = 4
+const MINIMAP_INNER_PADDING_Y = 0
 const MINIMAP_BASE_ROW_HEIGHT = 2
 const MINIMAP_MIN_ROW_HEIGHT = 1
 const MINIMAP_DENSITY_RANGE = 1
@@ -865,6 +866,15 @@ function drawMinimapFromCache(
   const sourceHeightInt = Math.max(1, Math.ceil(sourceHeight))
   const sourceStartPx = sourceStart * compression.pixelRowScale
   const sourceHeightPx = sourceHeightInt * compression.pixelRowScale
+  const drawSourceStartPx = Math.max(
+    0,
+    Math.min(compression.pixelTotalSourceRows - 1, sourceY * compression.pixelRowScale),
+  )
+  const drawSourceEndPx = Math.max(
+    drawSourceStartPx + 1,
+    Math.min(compression.pixelTotalSourceRows, (sourceY + sourceHeight) * compression.pixelRowScale),
+  )
+  const drawSourceHeightPx = Math.max(1, drawSourceEndPx - drawSourceStartPx)
 
   const canDrawCurrent = !!contentKey
     && isViewportCovered(state, compression, sourceStart, sourceHeightInt, contentKey, true)
@@ -877,9 +887,9 @@ function drawMinimapFromCache(
     c.drawImage(
       state.stitchSurface.canvas,
       0,
-      sourceStartPx,
+      drawSourceStartPx,
       compression.pixelColumnCount,
-      sourceHeightPx,
+      drawSourceHeightPx,
       drawX,
       drawY,
       drawWidth,
@@ -1320,86 +1330,57 @@ function getMinimapViewportMetrics(
   fullTrackHeight: number,
   verticalScrollbarSize: number,
   canvasDpr = 1,
-  contentHeightRatio = 1,
+  _contentHeightRatio = 1,
 ) {
-  const lineCount = Math.max(1, lineCountInput)
+  const lineCount = Math.max(1, Math.ceil(lineCountInput))
   const minimapPixelScale = Math.max(1, canvasDpr)
   const alignToDevicePixels = (value: number) => Math.round(value * minimapPixelScale) / minimapPixelScale
-  const clampedContentHeightRatio = Math.max(0, Math.min(1, contentHeightRatio))
   const fullMinimapHeight = Math.max(
     1 / minimapPixelScale,
-    alignToDevicePixels(fullTrackHeight - MINIMAP_INNER_PADDING * 2),
+    alignToDevicePixels(fullTrackHeight - MINIMAP_INNER_PADDING_Y * 2),
   )
-  const minimapHeight = Math.max(
-    1 / minimapPixelScale,
-    alignToDevicePixels(fullMinimapHeight * clampedContentHeightRatio),
-  )
+  const minimapHeight = fullMinimapHeight
   const minimapWidth = Math.max(
     1 / minimapPixelScale,
-    alignToDevicePixels(verticalScrollbarSize - MINIMAP_INNER_PADDING * 2),
+    alignToDevicePixels(verticalScrollbarSize - MINIMAP_INNER_PADDING_X * 2),
   )
   const maxPixelRowScale = Math.max(1, Math.round(MINIMAP_BITMAP_ROW_SCALE * minimapPixelScale))
   const maxTotalSourceRows = Math.max(1, Math.floor(MINIMAP_MAX_SURFACE_PIXELS / maxPixelRowScale))
   const geometry = computeMinimapGeometry(
     lineCount,
-    minimapHeight,
+    fullMinimapHeight,
     minimapWidth,
     maxTotalSourceRows,
   )
   const pixelRowScale = Math.max(1, Math.round(geometry.rowScale * minimapPixelScale))
-  const targetDrawHeight = Math.max(1, Math.round(minimapHeight))
+  const maxDrawHeight = (geometry.totalSourceRows * pixelRowScale) / minimapPixelScale
+  const drawHeight = Math.max(
+    1 / minimapPixelScale,
+    Math.min(minimapHeight, maxDrawHeight),
+  )
+  const sourceHeightExact = Math.max(
+    1,
+    Math.min(
+      geometry.totalSourceRows,
+      (drawHeight * minimapPixelScale) / pixelRowScale,
+    ),
+  )
   const sourceHeight = Math.max(
     1,
     Math.min(
       geometry.totalSourceRows,
-      Math.round((targetDrawHeight * minimapPixelScale) / pixelRowScale),
+      Math.ceil(sourceHeightExact),
     ),
   )
-  const drawHeight = Math.max(1, (sourceHeight * pixelRowScale) / minimapPixelScale)
   return {
     minimapHeight,
     minimapWidth,
     geometry,
     sourceHeight,
+    sourceHeightExact,
     drawHeight,
     minimapPixelScale,
   }
-}
-
-function getVisibleLogicalViewportRange(
-  lines: Lines,
-  layout: ScrollbarLayout,
-  scrollY: number,
-  lineCount: number,
-) {
-  if (lineCount <= 0) return { start: 0, endExclusive: 0, span: 0 }
-
-  const visibleTop = -layout.headerHeight - layout.paddingTop
-  const visibleBottom = layout.height - layout.paddingTop
-
-  if (typeof lines.getApproxVisibleLogicalRange === 'function') {
-    const approx = lines.getApproxVisibleLogicalRange(visibleTop, visibleBottom, scrollY)
-    if (approx) {
-      const start = Math.max(0, Math.min(lineCount - 1, approx.start))
-      const endExclusive = Math.max(start + 1, Math.min(lineCount, approx.end + 1))
-      return { start, endExclusive, span: Math.max(1, endExclusive - start) }
-    }
-  }
-
-  const visibleVisualLines = lines.getVisibleVisualLines(visibleTop, visibleBottom, scrollY)
-  if (visibleVisualLines.length === 0) return { start: 0, endExclusive: Math.min(1, lineCount), span: Math.min(1, lineCount) }
-
-  let start = lineCount - 1
-  let end = 0
-  for (let i = 0; i < visibleVisualLines.length; i++) {
-    const logicalLine = visibleVisualLines[i].logicalLine
-    if (logicalLine < start) start = logicalLine
-    if (logicalLine > end) end = logicalLine
-  }
-
-  const clampedStart = Math.max(0, Math.min(lineCount - 1, start))
-  const endExclusive = Math.max(clampedStart + 1, Math.min(lineCount, end + 1))
-  return { start: clampedStart, endExclusive, span: Math.max(1, endExclusive - clampedStart) }
 }
 
 export function getMinimapTrackHeightForLineCount(
@@ -1416,64 +1397,73 @@ export function getMinimapTrackHeightForLineCount(
   )
   return Math.max(
     MINIMAP_MIN_THUMB,
-    Math.min(fullTrackHeight, drawHeight + MINIMAP_INNER_PADDING * 2),
+    Math.min(fullTrackHeight, drawHeight + MINIMAP_INNER_PADDING_Y * 2),
   )
 }
 
 function getMinimapViewportModel(
   layout: ScrollbarLayout,
-  lines: Lines,
   scrollY = layout.scrollY,
   minimapLineCount?: number,
   canvasDpr = 1,
 ): MinimapViewportModel {
-  const lineCount = Math.max(1, minimapLineCount ?? 1)
+  const contentLineCount = Math.max(1, minimapLineCount ?? 1)
   const devicePixelScale = Math.max(1, canvasDpr)
   const alignToDevicePixels = (value: number) => Math.round(value * devicePixelScale) / devicePixelScale
   const fullMinimapHeight = Math.max(
     1 / devicePixelScale,
-    alignToDevicePixels(layout.height - MINIMAP_INNER_PADDING * 2),
+    alignToDevicePixels(layout.height - MINIMAP_INNER_PADDING_Y * 2),
   )
   const fullScrollRange = Math.max(0, -layout.scrollHeight)
   const contentScrollRange = Math.max(0, layout.totalHeight - layout.availableHeight)
   const scrollOffset = Math.max(0, Math.min(fullScrollRange, -scrollY))
-  const blankViewportHeight = Math.max(0, scrollOffset + layout.availableHeight - layout.totalHeight)
   const overscrollScrollRange = Math.max(0, fullScrollRange - contentScrollRange)
-  const currentModelHeight = Math.max(1, layout.totalHeight + blankViewportHeight)
-  const modelBaseHeight = Math.max(1, currentModelHeight - Math.max(0, scrollOffset - contentScrollRange))
-  const contentHeightRatio = Math.max(0, Math.min(1, layout.totalHeight / currentModelHeight))
+  const modelBaseHeight = Math.max(1, layout.totalHeight + overscrollScrollRange)
+  const contentHeightRatio = Math.max(0, Math.min(1, layout.totalHeight / modelBaseHeight))
+  const safeContentHeightRatio = contentHeightRatio > 0 ? contentHeightRatio : 1
+  const effectiveLineCount = Math.max(
+    contentLineCount,
+    Math.ceil(contentLineCount / safeContentHeightRatio),
+  )
   const minimapMetrics = getMinimapViewportMetrics(
-    lineCount,
+    effectiveLineCount,
     layout.height,
     layout.verticalScrollbarSize,
     canvasDpr,
-    contentHeightRatio,
   )
-  const { geometry, sourceHeight, drawHeight } = minimapMetrics
-  const visibleLogicalRange = getVisibleLogicalViewportRange(lines, layout, scrollY, lineCount)
-  const sourceRowsPerVisualLine = geometry.totalSourceRows / Math.max(1, lineCount)
-  const viewportSourceStart = visibleLogicalRange.start * sourceRowsPerVisualLine
+  const { geometry, sourceHeightExact, drawHeight } = minimapMetrics
+  const sourceRowsPerPixel = geometry.totalSourceRows / modelBaseHeight
   const viewportSourceHeight = Math.max(
-    sourceRowsPerVisualLine,
-    visibleLogicalRange.span * sourceRowsPerVisualLine,
+    Math.min(geometry.totalSourceRows, sourceRowsPerPixel),
+    Math.min(geometry.totalSourceRows, layout.availableHeight * sourceRowsPerPixel),
   )
-  const maxSourceY = Math.max(0, geometry.totalSourceRows - sourceHeight)
+  const viewportSourceStart = Math.max(
+    0,
+    Math.min(
+      Math.max(0, geometry.totalSourceRows - viewportSourceHeight),
+      scrollOffset * sourceRowsPerPixel,
+    ),
+  )
+  const visibleSourceHeight = Math.max(1, Math.min(geometry.totalSourceRows, sourceHeightExact))
+  const maxSourceY = Math.max(0, geometry.totalSourceRows - visibleSourceHeight)
   const maxViewportSourceStart = Math.max(0, geometry.totalSourceRows - viewportSourceHeight)
-  const sourceY = maxViewportSourceStart > 0
-    ? Math.max(
-        0,
-        Math.min(
-          maxSourceY,
-          (viewportSourceStart / maxViewportSourceStart) * maxSourceY,
-        ),
-      )
-    : 0
+  let sourceY = 0
+  if (maxViewportSourceStart > 0) {
+    sourceY = Math.max(
+      0,
+      Math.min(
+        maxSourceY,
+        (viewportSourceStart / maxViewportSourceStart) * maxSourceY,
+      ),
+    )
+  }
   const viewportSourceEnd = Math.min(geometry.totalSourceRows, viewportSourceStart + viewportSourceHeight)
-  const contentSliceStart = Math.max(0, Math.min(sourceHeight, viewportSourceStart - sourceY))
-  const contentSliceEnd = Math.max(0, Math.min(sourceHeight, viewportSourceEnd - sourceY))
-  const contentThumbOffset = sourceHeight > 0 ? (contentSliceStart / sourceHeight) * drawHeight : 0
-  const contentThumbHeight = sourceHeight > 0
-    ? ((Math.max(contentSliceStart, contentSliceEnd) - Math.min(contentSliceStart, contentSliceEnd)) / sourceHeight)
+  const contentSliceStart = Math.max(0, Math.min(visibleSourceHeight, viewportSourceStart - sourceY))
+  const contentSliceEnd = Math.max(0, Math.min(visibleSourceHeight, viewportSourceEnd - sourceY))
+  const contentThumbOffset = visibleSourceHeight > 0 ? (contentSliceStart / visibleSourceHeight) * drawHeight : 0
+  const contentThumbHeight = visibleSourceHeight > 0
+    ? ((Math.max(contentSliceStart, contentSliceEnd) - Math.min(contentSliceStart, contentSliceEnd))
+      / visibleSourceHeight)
       * drawHeight
     : drawHeight
   const blankTrackHeight = Math.max(0, fullMinimapHeight - drawHeight)
@@ -1492,7 +1482,7 @@ function getMinimapViewportModel(
   return {
     modelBaseHeight,
     viewportHeight: layout.availableHeight,
-    lineCount,
+    lineCount: effectiveLineCount,
     fullScrollRange,
     contentScrollRange,
     overscrollScrollRange,
@@ -1511,7 +1501,7 @@ function getMinimapViewportModel(
 
 function getVerticalThumbMetrics(
   layout: ScrollbarLayout,
-  lines: Lines,
+  _lines: Lines,
   scrollY = layout.scrollY,
   minimapLineCount?: number,
   canvasDpr = 1,
@@ -1544,7 +1534,7 @@ function getVerticalThumbMetrics(
   let thumbY = thumbTrackY
 
   if (isMinimapMode) {
-    const viewportModel = getMinimapViewportModel(layout, lines, scrollY, minimapLineCount, canvasDpr)
+    const viewportModel = getMinimapViewportModel(layout, scrollY, minimapLineCount, canvasDpr)
     modelBaseHeight = viewportModel.modelBaseHeight
     viewportHeight = viewportModel.viewportHeight
     minimapMode = viewportModel.minimapMetrics.geometry.mode
@@ -1553,7 +1543,7 @@ function getVerticalThumbMetrics(
     minimapDrawHeight = viewportModel.minimapMetrics.drawHeight
     minimapSourceY = viewportModel.sourceY
     minimapTotalSourceRows = viewportModel.minimapMetrics.geometry.totalSourceRows
-    thumbTrackY = alignToDevicePixels(trackY + MINIMAP_INNER_PADDING)
+    thumbTrackY = alignToDevicePixels(trackY + MINIMAP_INNER_PADDING_Y)
     thumbTrackHeight = viewportModel.fullMinimapHeight
     thumbHeight = viewportModel.thumbHeight
     trackLength = viewportModel.trackLength
@@ -1637,7 +1627,7 @@ export function hitTestScrollbar(
   const layout = getScrollbarLayout(canvas, scroll, lines, settings, gutter, header)
 
   if (layout.needsVertical) {
-    const scrollYForHit = scroll.pos.y === Infinity ? layout.scrollY : scroll.pos.y
+    const scrollYForHit = scroll.pos.y === Infinity ? 0 : scroll.pos.y
     const verticalMetrics = getVerticalScrollbarMetrics(
       canvas,
       scroll,
@@ -1687,9 +1677,7 @@ export function drawScrollbars(context: Context) {
   const layout = getScrollbarLayout(canvas, scroll, lines, settings, gutter, header)
 
   if (layout.needsVertical) {
-    const liveScrollY = context.scrollbars.isDragging.value
-      ? layout.scrollY
-      : (scroll.pos.y === Infinity ? layout.scrollY : scroll.pos.y)
+    const liveScrollY = scroll.pos.y === Infinity ? 0 : scroll.pos.y
     const { scrollbarX, trackY, trackHeight, thumbHeight, thumbY } = getVerticalThumbMetrics(
       layout,
       lines,
@@ -1707,10 +1695,10 @@ export function drawScrollbars(context: Context) {
       c.fillRect(scrollbarX, trackY, layout.verticalScrollbarSize, fullTrackHeight)
       drawMinimapLeftShadow(c, scrollbarX, trackY, fullTrackHeight)
 
-      const viewportModel = getMinimapViewportModel(layout, lines, liveScrollY, context.doc.lines.length, canvasDpr)
-      const minimapX = alignToDevicePixels(scrollbarX + MINIMAP_INNER_PADDING)
-      const minimapY = alignToDevicePixels(trackY + MINIMAP_INNER_PADDING)
-      const { geometry, sourceHeight, drawHeight, minimapPixelScale } = viewportModel.minimapMetrics
+      const viewportModel = getMinimapViewportModel(layout, liveScrollY, context.doc.lines.length, canvasDpr)
+      const minimapX = alignToDevicePixels(scrollbarX + MINIMAP_INNER_PADDING_X)
+      const minimapY = alignToDevicePixels(trackY + MINIMAP_INNER_PADDING_Y)
+      const { geometry, sourceHeight, sourceHeightExact, drawHeight, minimapPixelScale } = viewportModel.minimapMetrics
       const sourceY = viewportModel.sourceY
       const compression = buildCompressionState(
         viewportModel.lineCount,
@@ -1736,7 +1724,7 @@ export function drawScrollbars(context: Context) {
       }
 
       state.contentKey = contentKey
-      queueSnapshotRender(context, state, compression, theme, sourceY, sourceHeight, burstMode)
+      queueSnapshotRender(context, state, compression, theme, sourceY, sourceHeightExact, burstMode)
 
       c.save()
       c.beginPath()
@@ -1747,7 +1735,7 @@ export function drawScrollbars(context: Context) {
         c,
         state,
         sourceY,
-        sourceHeight,
+        sourceHeightExact,
         minimapX,
         minimapY,
         drawWidth,

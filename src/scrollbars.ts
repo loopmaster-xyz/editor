@@ -113,11 +113,12 @@ export function createScrollbars(canvas: Canvas, scroll: Scroll, lines: Lines, s
   >>): number => {
     const fullScrollRange = Math.max(0, -verticalMetrics.scrollHeight)
     if (fullScrollRange <= 0) return 0
-    const clampedThumbOffset = Math.max(0, Math.min(verticalMetrics.trackLength, thumbOffset))
 
     if (verticalMetrics.isMinimap) {
-      return getMinimapScrollOffsetFromRenderedThumbOffset(clampedThumbOffset, verticalMetrics)
+      return getMinimapScrollOffsetFromRenderedThumbOffset(thumbOffset, verticalMetrics)
     }
+
+    const clampedThumbOffset = Math.max(0, Math.min(verticalMetrics.trackLength, thumbOffset))
 
     if (verticalMetrics.contentScrollRange <= 0 && verticalMetrics.overscrollScrollRange > 0) {
       if (verticalMetrics.overscrollTrackLength <= 0) return 0
@@ -217,7 +218,7 @@ export function createScrollbars(canvas: Canvas, scroll: Scroll, lines: Lines, s
     if (!hit.type) return false
 
     const layout = getLayout()
-    const liveScrollY = scroll.pos.y === Infinity ? scroll.targetY.value : scroll.pos.y
+    const liveScrollY = scroll.pos.y === Infinity ? 0 : scroll.pos.y
 
     if (hit.type && hit.thumb) {
       isDragging.value = true
