@@ -40,6 +40,7 @@ const MINIMAP_WORKER_THROTTLE_SETTLE_MS = 24
 const MINIMAP_MAX_CHUNK_LINES = 1536
 const MINIMAP_MAX_SURFACE_PIXELS = 32767
 const MINIMAP_MAX_LINE_CHARS = 100
+const MINIMAP_PIXEL_ALPHA = 0.5
 const MINIMAP_BACKGROUND_ALPHA = 0.62
 const MINIMAP_BACKGROUND_HOVER_ALPHA = 0.52
 const MINIMAP_LEFT_SHADOW_WIDTH = 7
@@ -138,6 +139,8 @@ type MinimapRenderState = {
   latchedViewportSourceStart: number
   latchedViewportSourceHeight: number
   latchedViewportContentKey: string | null
+  latchedViewportDrawWidth: number
+  latchedViewportDrawHeight: number
   readyChunks: Set<number>
   chunkContentKey: Map<number, string>
   pendingSnapshot: MinimapSnapshot | null
@@ -163,6 +166,7 @@ let minimapRequestId = 0
 const minimapRenderStateByContext = new WeakMap<Context, MinimapRenderState>()
 const minimapWorkerRequests = new Map<number, MinimapWorkerRequestMeta>()
 const parsedColorCache = new Map<string, Rgb>()
+const minimapThemePaletteCache = new Map<string, Record<TokenType, Rgb>>()
 const EMPTY_MINIMAP_TOKEN_LINE: Token[] = []
 const minimapCompactTokenLineCache = new WeakMap<Token[], Token[]>()
 
@@ -261,6 +265,86 @@ function getMinimapThemeSnapshot(context: Context): MinimapThemeSnapshot {
       textColor: theme.text?.color,
       byTokenType,
     },
+  }
+}
+
+function getMinimapThemePalette(theme: MinimapThemeSnapshot): Record<TokenType, Rgb> {
+  const cached = minimapThemePaletteCache.get(theme.themeKey)
+  if (cached) return cached
+
+  const palette = {} as Record<TokenType, Rgb>
+  const fallback = parseColorToRgb(theme.payload.textColor, { r: 255, g: 255, b: 255 })
+  for (let i = 0; i < MINIMAP_TOKEN_TYPES.length; i++) {
+    const tokenType = MINIMAP_TOKEN_TYPES[i]
+    palette[tokenType] = parseColorToRgb(theme.payload.byTokenType[tokenType], fallback)
+  }
+
+  minimapThemePaletteCache.set(theme.themeKey, palette)
+  return palette
+}
+
+function isWhitespaceTokenText(text: string): boolean {
+  if (text.length === 0) return false
+  for (let i = 0; i < text.length; i++) {
+    if (text.charCodeAt(i) > 32) return false
+  }
+  return true
+}
+
+function mapMinimapSpan(
+  startChar: number,
+  length: number,
+  columnCount: number,
+  columnScale: number,
+): [number, number] | null
+{
+  if (length <= 0) return null
+  const start = Math.max(0, startChar)
+  const end = Math.max(start + 1, start + length)
+  let colStart = Math.floor(start * columnScale)
+  let colEnd = Math.ceil(end * columnScale)
+  if (colStart >= columnCount) return null
+  if (colStart < 0) colStart = 0
+  if (colEnd <= colStart) colEnd = colStart + 1
+  if (colEnd > columnCount) colEnd = columnCount
+  return [colStart, colEnd]
+}
+
+function drawMinimapTokenLineIntoRow(
+  lineTokens: Token[] | undefined,
+  palette: Record<TokenType, Rgb>,
+  rowHits: Uint8Array,
+  rowColorR: Uint16Array,
+  rowColorG: Uint16Array,
+  rowColorB: Uint16Array,
+  rowColorN: Uint8Array,
+  columnCount: number,
+  columnScale: number,
+) {
+  if (!lineTokens || lineTokens.length === 0) return
+
+  let charCursor = 0
+  for (let tokenIndex = 0; tokenIndex < lineTokens.length; tokenIndex++) {
+    const token = lineTokens[tokenIndex]
+    const tokenText = token?.text ?? ''
+    if (tokenText.length === 0) continue
+
+    const start = charCursor
+    charCursor += tokenText.length
+
+    const tokenType = token?.type ?? 'text'
+    if (tokenType === 'text' && isWhitespaceTokenText(tokenText)) continue
+    const mapped = mapMinimapSpan(start, tokenText.length, columnCount, columnScale)
+    if (!mapped) continue
+
+    const color = palette[tokenType] ?? palette.text
+    for (let col = mapped[0]; col < mapped[1]; col++) {
+      rowHits[col] = 1
+      rowColorR[col] += color.r
+      rowColorG[col] += color.g
+      rowColorB[col] += color.b
+      rowColorN[col] = Math.min(255, rowColorN[col] + 1)
+    }
   }
 }
 
@@ -401,6 +485,8 @@ function getMinimapRenderState(context: Context): MinimapRenderState {
     latchedViewportSourceStart: -1,
     latchedViewportSourceHeight: -1,
     latchedViewportContentKey: null,
+    latchedViewportDrawWidth: -1,
+    latchedViewportDrawHeight: -1,
     readyChunks: new Set<number>(),
     chunkContentKey: new Map<number, string>(),
     pendingSnapshot: null,
@@ -427,6 +513,29 @@ function clearMinimapWorkerRequests() {
     }
   }
   minimapWorkerRequests.clear()
+}
+
+function clearMinimapWorkerRequestsForState(state: MinimapRenderState) {
+  for (const [requestId, request] of minimapWorkerRequests) {
+    if (request.state !== state) continue
+    minimapWorkerRequests.delete(requestId)
+    if (state.inFlightRequestId === requestId) {
+      state.inFlightRequestId = null
+      state.inFlightChunkIndex = null
+      state.inFlightCompressionKey = null
+      state.inFlightContentKey = null
+    }
+  }
+}
+
+export function invalidateMinimapRenderState(context: Context) {
+  const state = minimapRenderStateByContext.get(context)
+  if (!state) return
+
+  clearMinimapWorkerRequestsForState(state)
+  state.renderContentKey = null
+  state.pendingSnapshot = null
+  state.lastDispatchAt = 0
 }
 
 function dropMinimapWorker() {
@@ -627,6 +736,94 @@ function isViewportCovered(
   return true
 }
 
+function seedLatchedViewportFromDoc(
+  state: MinimapRenderState,
+  compression: MinimapCompressionState,
+  sourceStart: number,
+  sourceHeightInt: number,
+  drawWidth: number,
+  drawHeight: number,
+  contentKey: string,
+  theme: MinimapThemeSnapshot,
+): boolean {
+  const sourceHeightPx = Math.max(1, sourceHeightInt * compression.pixelRowScale)
+  const latchedViewportSurface = ensureSurface(
+    state.latchedViewportSurface,
+    compression.pixelColumnCount,
+    sourceHeightPx,
+  )
+  if (!latchedViewportSurface) return false
+
+  const palette = getMinimapThemePalette(theme)
+  const width = compression.pixelColumnCount
+  const imageData = latchedViewportSurface.c.createImageData(width, sourceHeightPx)
+  const image = imageData.data
+  const alpha = clampByte(Math.round(MINIMAP_PIXEL_ALPHA * 255))
+  const rowHits = new Uint8Array(width)
+  const rowColorR = new Uint16Array(width)
+  const rowColorG = new Uint16Array(width)
+  const rowColorB = new Uint16Array(width)
+  const rowColorN = new Uint8Array(width)
+  const columnScale = width / MINIMAP_MAX_LINE_CHARS
+  const lines = state.context.doc.lines
+  const tokenLines = state.context.doc.tokenLines
+
+  for (let row = 0; row < sourceHeightInt; row++) {
+    rowHits.fill(0)
+    rowColorR.fill(0)
+    rowColorG.fill(0)
+    rowColorB.fill(0)
+    rowColorN.fill(0)
+
+    const sourceRow = sourceStart + row
+    const lineStart = sourceRow * compression.lineSpan
+    const lineEnd = Math.min(lines.length, lineStart + compression.lineSpan)
+    for (let lineIndex = lineStart; lineIndex < lineEnd; lineIndex++) {
+      const compact = compactTokenLineForWorker(tokenLines[lineIndex])
+      const preparedLine = compact !== EMPTY_MINIMAP_TOKEN_LINE
+        ? compact
+        : createFallbackTokenLineForWorker(lines[lineIndex] ?? '')
+      drawMinimapTokenLineIntoRow(
+        preparedLine,
+        palette,
+        rowHits,
+        rowColorR,
+        rowColorG,
+        rowColorB,
+        rowColorN,
+        width,
+        columnScale,
+      )
+    }
+
+    for (let scaleRow = 0; scaleRow < compression.pixelRowScale; scaleRow++) {
+      const bitmapRow = row * compression.pixelRowScale + scaleRow
+      if (bitmapRow >= sourceHeightPx) break
+      const rowOffset = bitmapRow * width * 4
+      for (let col = 0; col < width; col++) {
+        if (rowHits[col] !== 1) continue
+        const offset = rowOffset + col * 4
+        const n = Math.max(1, rowColorN[col])
+        image[offset] = clampByte(Math.round(rowColorR[col] / n))
+        image[offset + 1] = clampByte(Math.round(rowColorG[col] / n))
+        image[offset + 2] = clampByte(Math.round(rowColorB[col] / n))
+        image[offset + 3] = alpha
+      }
+    }
+  }
+
+  latchedViewportSurface.c.putImageData(imageData, 0, 0)
+  state.latchedViewportSurface = latchedViewportSurface
+  state.latchedViewportCompressionKey = compression.key
+  state.latchedViewportSourceStart = sourceStart
+  state.latchedViewportSourceHeight = sourceHeightInt
+  state.latchedViewportContentKey = contentKey
+  state.latchedViewportDrawWidth = drawWidth
+  state.latchedViewportDrawHeight = drawHeight
+
+  return true
+}
+
 function drawMinimapFromCache(
   c: CanvasRenderingContext2D,
   state: MinimapRenderState,
@@ -636,17 +833,19 @@ function drawMinimapFromCache(
   drawY: number,
   drawWidth: number,
   drawHeight: number,
+  theme: MinimapThemeSnapshot,
 ): boolean {
   const compression = state.compression
+  if (!compression) return false
   const contentKey = state.contentKey
-  if (!compression || !contentKey) return false
 
   const sourceStart = Math.max(0, Math.floor(sourceY))
   const sourceHeightInt = Math.max(1, Math.ceil(sourceHeight))
   const sourceStartPx = sourceStart * compression.pixelRowScale
   const sourceHeightPx = sourceHeightInt * compression.pixelRowScale
 
-  const canDrawCurrent = isViewportCovered(state, compression, sourceStart, sourceHeightInt, contentKey, true)
+  const canDrawCurrent = !!contentKey
+    && isViewportCovered(state, compression, sourceStart, sourceHeightInt, contentKey, true)
   const shouldDrawFromStitch = canDrawCurrent
 
   const previousSmoothing = c.imageSmoothingEnabled
@@ -695,6 +894,8 @@ function drawMinimapFromCache(
         state.latchedViewportSourceStart = sourceStart
         state.latchedViewportSourceHeight = sourceHeightInt
         state.latchedViewportContentKey = latchedContentKey
+        state.latchedViewportDrawWidth = drawWidth
+        state.latchedViewportDrawHeight = drawHeight
       }
     }
 
@@ -702,7 +903,31 @@ function drawMinimapFromCache(
     return true
   }
 
+  if (contentKey && state.latchedViewportContentKey !== contentKey) {
+    seedLatchedViewportFromDoc(
+      state,
+      compression,
+      sourceStart,
+      sourceHeightInt,
+      drawWidth,
+      drawHeight,
+      contentKey,
+      theme,
+    )
+  }
+
   if (state.latchedViewportSurface) {
+    const fallbackDrawWidth = state.latchedViewportDrawWidth > 0
+      ? state.latchedViewportDrawWidth
+      : drawWidth
+    const fallbackDrawHeight = state.latchedViewportDrawHeight > 0
+      ? state.latchedViewportDrawHeight
+      : drawHeight
+    const drawSizeChanged = Math.abs(fallbackDrawWidth - drawWidth) > 0.5
+      || Math.abs(fallbackDrawHeight - drawHeight) > 0.5
+    const targetDrawWidth = drawSizeChanged ? fallbackDrawWidth : drawWidth
+    const targetDrawHeight = drawSizeChanged ? fallbackDrawHeight : drawHeight
+
     c.drawImage(
       state.latchedViewportSurface.canvas,
       0,
@@ -711,8 +936,8 @@ function drawMinimapFromCache(
       state.latchedViewportSurface.height,
       drawX,
       drawY,
-      drawWidth,
-      drawHeight,
+      targetDrawWidth,
+      targetDrawHeight,
     )
     c.imageSmoothingEnabled = previousSmoothing
     return true
@@ -993,10 +1218,16 @@ export interface VerticalScrollbarMetrics {
   scrollbarX: number
   trackY: number
   trackHeight: number
+  thumbTrackY: number
   thumbTrackHeight: number
+  trackLength: number
   thumbHeight: number
   thumbY: number
   scrollHeight: number
+  contentScrollRange: number
+  overscrollScrollRange: number
+  contentTrackLength: number
+  overscrollTrackLength: number
 }
 
 export function getVerticalScrollbarSize(settings: Settings): number {
@@ -1054,13 +1285,19 @@ function getMinimapViewportMetrics(
   fullTrackHeight: number,
   verticalScrollbarSize: number,
   canvasDpr = 1,
+  contentHeightRatio = 1,
 ) {
   const lineCount = Math.max(1, lineCountInput)
   const minimapPixelScale = Math.max(1, canvasDpr)
   const alignToDevicePixels = (value: number) => Math.round(value * minimapPixelScale) / minimapPixelScale
-  const minimapHeight = Math.max(
+  const clampedContentHeightRatio = Math.max(0, Math.min(1, contentHeightRatio))
+  const fullMinimapHeight = Math.max(
     1 / minimapPixelScale,
     alignToDevicePixels(fullTrackHeight - MINIMAP_INNER_PADDING * 2),
+  )
+  const minimapHeight = Math.max(
+    1 / minimapPixelScale,
+    alignToDevicePixels(fullMinimapHeight * clampedContentHeightRatio),
   )
   const minimapWidth = Math.max(
     1 / minimapPixelScale,
@@ -1118,38 +1355,120 @@ function getVerticalThumbMetrics(
   minimapLineCount?: number,
   canvasDpr = 1,
 ) {
+  const isMinimapMode = layout.verticalScrollbarSize === MINIMAP_SCROLLBAR_SIZE
   const scrollbarX = layout.width - layout.verticalScrollbarSize
-  const trackY = layout.verticalScrollbarSize === MINIMAP_SCROLLBAR_SIZE ? 0 : layout.headerHeight
+  const trackY = isMinimapMode ? 0 : layout.headerHeight
   const trackHeight = layout.height - trackY
+  const devicePixelScale = Math.max(1, canvasDpr)
+  const alignToDevicePixels = (value: number) => Math.round(value * devicePixelScale) / devicePixelScale
+  let thumbTrackY = trackY
+  let thumbAreaHeight = trackHeight
   let thumbTrackHeight = trackHeight
+  let thumbHeightTrackHeight = trackHeight
+  let contentTrackLength = 0
+  let overscrollTrackLength = 0
 
-  if (layout.verticalScrollbarSize === MINIMAP_SCROLLBAR_SIZE) {
+  const fullScrollRange = Math.max(0, -layout.scrollHeight)
+  const rawContentScrollRange = Math.max(0, layout.totalHeight - layout.availableHeight)
+  const contentScrollRange = isMinimapMode ? rawContentScrollRange : fullScrollRange
+  const overscrollScrollRange = isMinimapMode ? Math.max(0, fullScrollRange - rawContentScrollRange) : 0
+  const scrollOffset = Math.max(0, Math.min(fullScrollRange, -scrollY))
+
+  if (isMinimapMode) {
     const fallbackLineCount = Math.max(1, Math.round(layout.totalHeight / 16))
-    thumbTrackHeight = getMinimapTrackHeightForLineCount(
+    const minimapMetrics = getMinimapViewportMetrics(
       minimapLineCount ?? fallbackLineCount,
       trackHeight,
       layout.verticalScrollbarSize,
       canvasDpr,
+      1,
     )
+    const fullMinimapHeight = Math.max(
+      1 / devicePixelScale,
+      alignToDevicePixels(trackHeight - MINIMAP_INNER_PADDING * 2),
+    )
+    thumbTrackY = alignToDevicePixels(trackY + MINIMAP_INNER_PADDING)
+    // Thumb can travel across the full minimap lane.
+    thumbAreaHeight = fullMinimapHeight
+    // Keep compression geometry stable; visible content translation handles overscroll visualization.
+    thumbHeightTrackHeight = Math.min(fullMinimapHeight, minimapMetrics.drawHeight)
+    thumbTrackHeight = thumbHeightTrackHeight
   }
 
-  const scrollRange = Math.max(0, -layout.scrollHeight)
   const thumbHeightUnclamped = Math.max(
     SCROLLBAR_MIN_THUMB,
-    (layout.availableHeight / layout.totalHeight) * thumbTrackHeight,
+    (layout.availableHeight / layout.totalHeight) * thumbHeightTrackHeight,
   )
-  const thumbHeight = Math.min(thumbTrackHeight, thumbHeightUnclamped)
-  const trackLength = Math.max(0, thumbTrackHeight - thumbHeight)
-  const scrollRatio = scrollRange > 0 ? Math.max(0, Math.min(1, -scrollY / scrollRange)) : 0
-  const thumbY = trackY + scrollRatio * trackLength
+  const thumbHeight = Math.min(thumbHeightTrackHeight, thumbHeightUnclamped)
+  const maxTrackLength = Math.max(0, thumbAreaHeight - thumbHeight)
+  const compressedMinimapEpsilon = 1 / devicePixelScale
+  const isCompressedMinimap = isMinimapMode && thumbTrackHeight >= (thumbAreaHeight - compressedMinimapEpsilon)
+
+  if (isMinimapMode) {
+    const contentVisibleTrackLength = Math.max(0, Math.min(maxTrackLength, thumbTrackHeight - thumbHeight))
+    if (contentScrollRange > 0 && overscrollScrollRange > 0) {
+      if (isCompressedMinimap) {
+        const fullScrollSpan = contentScrollRange + overscrollScrollRange
+        const proportionalContentTrackLength = fullScrollSpan > 0
+          ? (maxTrackLength * contentScrollRange) / fullScrollSpan
+          : maxTrackLength
+        contentTrackLength = Math.max(0, Math.min(maxTrackLength, proportionalContentTrackLength))
+        overscrollTrackLength = Math.max(0, maxTrackLength - contentTrackLength)
+      }
+      else {
+        contentTrackLength = contentVisibleTrackLength
+        const remainingTrackLength = Math.max(0, maxTrackLength - contentTrackLength)
+        const contentScrollSlope = contentTrackLength / contentScrollRange
+        const overscrollTrackLengthUnclamped = overscrollScrollRange * contentScrollSlope
+        overscrollTrackLength = Math.max(
+          0,
+          Math.min(remainingTrackLength, overscrollTrackLengthUnclamped),
+        )
+      }
+    }
+    else {
+      contentTrackLength = contentVisibleTrackLength
+      overscrollTrackLength = 0
+    }
+  }
+  else {
+    contentTrackLength = maxTrackLength
+    overscrollTrackLength = 0
+  }
+
+  const trackLength = Math.max(0, Math.min(maxTrackLength, contentTrackLength + overscrollTrackLength))
+  let thumbOffset = 0
+
+  if (overscrollScrollRange > 0 && contentScrollRange > 0 && scrollOffset > contentScrollRange) {
+    const overscrollOffset = scrollOffset - contentScrollRange
+    const overscrollRatio = overscrollScrollRange > 0 ? overscrollOffset / overscrollScrollRange : 0
+    thumbOffset = contentTrackLength + overscrollRatio * overscrollTrackLength
+  }
+  else if (contentScrollRange > 0) {
+    const contentRatio = scrollOffset / contentScrollRange
+    thumbOffset = contentRatio * contentTrackLength
+  }
+  else if (overscrollScrollRange > 0) {
+    const overscrollRatio = scrollOffset / overscrollScrollRange
+    thumbOffset = overscrollRatio * overscrollTrackLength
+  }
+
+  const thumbY = thumbTrackY + Math.max(0, Math.min(trackLength, thumbOffset))
+  thumbTrackHeight = thumbHeight + trackLength
 
   return {
     scrollbarX,
     trackY,
     trackHeight,
+    thumbTrackY,
     thumbTrackHeight,
+    trackLength,
     thumbHeight,
     thumbY,
+    contentScrollRange,
+    overscrollScrollRange,
+    contentTrackLength,
+    overscrollTrackLength,
   }
 }
 
@@ -1245,7 +1564,7 @@ export function drawScrollbars(context: Context) {
       : (context.scrollbars.isDragging.value
           ? layout.scrollY
           : (scroll.pos.y === Infinity ? layout.scrollY : scroll.pos.y))
-    const { scrollbarX, trackY, trackHeight, thumbHeight, thumbY } = getVerticalThumbMetrics(
+    const { scrollbarX, trackY, trackHeight, thumbHeight, thumbY, overscrollTrackLength } = getVerticalThumbMetrics(
       layout,
       liveScrollY,
       context.doc.lines.length,
@@ -1262,24 +1581,40 @@ export function drawScrollbars(context: Context) {
       drawMinimapLeftShadow(c, scrollbarX, trackY, fullTrackHeight)
 
       const lineCount = Math.max(1, context.doc.lines.length)
+      const fullScrollRangeY = Math.max(0, -layout.scrollHeight)
+      const contentScrollRangeY = Math.max(0, layout.totalHeight - layout.availableHeight)
+      const overscrollScrollRangeY = Math.max(0, fullScrollRangeY - contentScrollRangeY)
+      const scrollOffsetY = Math.max(0, Math.min(fullScrollRangeY, -liveScrollY))
+      const overscrollOffsetY = Math.max(0, scrollOffsetY - contentScrollRangeY)
+      const overscrollProgressY = overscrollScrollRangeY > 0
+        ? Math.max(0, Math.min(1, overscrollOffsetY / overscrollScrollRangeY))
+        : 0
       const minimapMetrics = getMinimapViewportMetrics(
         lineCount,
         trackHeight,
         layout.verticalScrollbarSize,
         canvasDpr,
+        1,
       )
       const minimapX = alignToDevicePixels(scrollbarX + MINIMAP_INNER_PADDING)
       const minimapY = alignToDevicePixels(trackY + MINIMAP_INNER_PADDING)
       const { geometry, sourceHeight, drawHeight, minimapPixelScale } = minimapMetrics
+      const fullMinimapHeight = Math.max(
+        1 / canvasDpr,
+        alignToDevicePixels(trackHeight - MINIMAP_INNER_PADDING * 2),
+      )
+      const isCompressedMinimap = drawHeight >= fullMinimapHeight - (1 / canvasDpr)
+      const overscrollVisualMaxShift = isCompressedMinimap && overscrollScrollRangeY > 0
+        ? alignToDevicePixels(Math.min(drawHeight, Math.max(0, overscrollTrackLength)))
+        : 0
+      const overscrollVisualShift = alignToDevicePixels(overscrollProgressY * overscrollVisualMaxShift)
+      const minimapDrawY = minimapY - overscrollVisualShift
 
-      const fullScrollRangeY = Math.max(0, -layout.scrollHeight)
-      const contentScrollRangeY = Math.max(0, layout.totalHeight - layout.availableHeight)
-      const scrollOffsetY = Math.max(0, Math.min(fullScrollRangeY, -liveScrollY))
       // Overscroll is blank space after the real content; keep the minimap content pinned at EOF.
       const contentScrollOffsetY = Math.min(scrollOffsetY, contentScrollRangeY)
       const scrollRatioY = contentScrollRangeY > 0 ? contentScrollOffsetY / contentScrollRangeY : 0
       const maxSourceY = Math.max(0, geometry.totalSourceRows - sourceHeight)
-      const sourceY = Math.max(0, Math.min(maxSourceY, Math.round(scrollRatioY * maxSourceY)))
+      const sourceY = Math.max(0, Math.min(maxSourceY, Math.floor(scrollRatioY * maxSourceY)))
 
       const compression = buildCompressionState(lineCount, geometry, sourceHeight, minimapPixelScale)
       // Draw at the exact CSS size that maps to the source pixel crop to avoid stretch blits.
@@ -1291,12 +1626,21 @@ export function drawScrollbars(context: Context) {
         ? state.renderContentKey
         : rawContentKey
       const burstMode = isMinimapBurstMode(context)
-      if (!state.compression || state.compression.key !== compression.key) {
+      state.contentKey = contentKey
+      if (!state.compression
+        || state.compression.key !== compression.key
+        || state.compression.lineCount !== compression.lineCount)
+      {
         resetCompressionState(state, compression)
       }
 
       state.contentKey = contentKey
       queueSnapshotRender(context, state, compression, theme, sourceY, sourceHeight, burstMode)
+
+      c.save()
+      c.beginPath()
+      c.rect(minimapX, minimapY, drawWidth, drawHeight)
+      c.clip()
 
       const drewCached = drawMinimapFromCache(
         c,
@@ -1304,20 +1648,21 @@ export function drawScrollbars(context: Context) {
         sourceY,
         sourceHeight,
         minimapX,
-        minimapY,
+        minimapDrawY,
         drawWidth,
         drawHeight,
+        theme,
       )
 
       if (!drewCached) {
         c.fillStyle = 'rgba(255, 255, 255, 0.02)'
-        c.fillRect(minimapX, minimapY, drawWidth, drawHeight)
+        c.fillRect(minimapX, minimapDrawY, drawWidth, drawHeight)
       }
+      c.restore()
 
-      const viewportHeight = Math.max(1, (layout.availableHeight / Math.max(1, layout.totalHeight)) * drawHeight)
-      const viewportTrackLength = Math.max(0, drawHeight - viewportHeight)
-      const viewportScrollRatioY = contentScrollRangeY > 0 ? scrollOffsetY / contentScrollRangeY : 0
-      const viewportY = minimapY + viewportScrollRatioY * viewportTrackLength
+      // Keep viewport visuals on the exact same geometry used by minimap drag/hit-testing.
+      const viewportHeight = thumbHeight
+      const viewportY = thumbY
 
       c.fillStyle = isHovered ? MINIMAP_VIEWPORT_HOVER_COLOR : MINIMAP_VIEWPORT_COLOR
       c.fillRect(scrollbarX + 1, viewportY, Math.max(1, layout.verticalScrollbarSize - 2), viewportHeight)

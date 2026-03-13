@@ -3,7 +3,7 @@ import { BufferOpType } from './buffer.ts'
 import type { Canvas } from './canvas.ts'
 import { createContext, Position } from './context.ts'
 import { createDoc, type Doc } from './doc.ts'
-import { HORIZONTAL_SCROLLBAR_SIZE } from './draw/scrollbar.ts'
+import { HORIZONTAL_SCROLLBAR_SIZE, invalidateMinimapRenderState } from './draw/scrollbar.ts'
 import { activeEditor as activeEditorSignal, setActiveEditor } from './editor-state.ts'
 import { disposables } from './lib/disposables.ts'
 import { createRender, type Render } from './render.ts'
@@ -63,7 +63,7 @@ export function createEditor(settings: Partial<EditorSettings> = {}) {
       return
     }
 
-    await warmup(context, newDoc.tokenLines)
+    void warmup(context, newDoc.tokenLines).catch(error => console.error(error))
 
     batch(() => {
       doc.tokenize = newDoc.tokenize
@@ -71,6 +71,7 @@ export function createEditor(settings: Partial<EditorSettings> = {}) {
       doc.buffer.history.value = newDoc.buffer.history.value
       doc.buffer.index.value = newDoc.buffer.index.value
     })
+    invalidateMinimapRenderState(context)
 
     effects.push(
       (() => {
@@ -167,7 +168,14 @@ export function createEditor(settings: Partial<EditorSettings> = {}) {
       }),
     )
 
-    context.reset()
+    batch(() => {
+      const nextScrollX = Number.isFinite(newDoc.scroll.x) ? newDoc.scroll.x : 0
+      const nextScrollY = Number.isFinite(newDoc.scroll.y) ? newDoc.scroll.y : 0
+      context.scroll.pos.x = nextScrollX
+      context.scroll.pos.y = nextScrollY
+      context.scroll.targetX.value = nextScrollX
+      context.scroll.targetY.value = nextScrollY
+    })
   }
 
   let render: Render | undefined

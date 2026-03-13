@@ -3,7 +3,6 @@ import type { Selection } from './selection.ts'
 import {
   getTextareaElement,
   setActiveClipboard,
-  shouldSuppressCaretVisibleOnRefocus,
 } from './textarea-singleton.ts'
 import type { Canvas } from './canvas.ts'
 
@@ -17,6 +16,7 @@ const PASTE_STREAM_TRIGGER_CHARS = 192 * 1024
 const PASTE_STREAM_CHUNK_CHARS = 64 * 1024
 const PASTE_STREAM_STEP_DELAY_MS = 0
 const PASTE_POST_LAYOUT_CARET_PASSES = 2
+const MODIFIER_KEYS = new Set(['Control', 'Meta', 'Alt', 'Shift'])
 
 type ChunkedPasteState = {
   segments: string[]
@@ -446,9 +446,8 @@ export function createClipboard(
     if (pendingPasteText.length > 0) {
       flushPendingPaste()
     }
-    if (!shouldSuppressCaretVisibleOnRefocus()) {
-      maybeEnsureCaretVisible(true)
-    }
+    if (MODIFIER_KEYS.has(event.key)) return
+    maybeEnsureCaretVisible(true)
   }
 
   const handlers = {

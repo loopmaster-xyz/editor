@@ -13,8 +13,6 @@ let textarea: HTMLTextAreaElement | null = null
 let activeHandlers: ClipboardHandlers | null = null
 let activeCanvas: HTMLCanvasElement | null = null
 let isRefocusing = false
-const WINDOW_REFOCUS_SUPPRESS_MS = 250
-let suppressCaretVisibleUntil = 0
 
 function getTextarea(): HTMLTextAreaElement {
   if (!textarea) {
@@ -48,13 +46,8 @@ function getTextarea(): HTMLTextAreaElement {
     }
 
     const handleWindowFocus = () => {
-      suppressCaretVisibleUntil = Date.now() + WINDOW_REFOCUS_SUPPRESS_MS
       if (activeCanvas && document.activeElement === activeCanvas) {
-        setTimeout(() => {
-          if (activeCanvas && document.activeElement !== textarea) {
-            textarea?.focus()
-          }
-        }, 10)
+        textarea.focus()
       }
     }
 
@@ -141,8 +134,4 @@ export function setActiveCanvas(canvas: HTMLCanvasElement | null) {
 
 export function getTextareaElement(): HTMLTextAreaElement {
   return getTextarea()
-}
-
-export function shouldSuppressCaretVisibleOnRefocus(): boolean {
-  return Date.now() < suppressCaretVisibleUntil
 }

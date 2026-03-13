@@ -67,6 +67,54 @@ export function createScrollbars(canvas: Canvas, scroll: Scroll, lines: Lines, s
     return { trackWidth, thumbWidth }
   }
 
+  const getScrollOffsetFromThumbOffset = (thumbOffset: number, verticalMetrics: NonNullable<ReturnType<
+    typeof getVerticalScrollbarMetrics
+  >>): number => {
+    const fullScrollRange = Math.max(0, -verticalMetrics.scrollHeight)
+    if (fullScrollRange <= 0) return 0
+    const clampedThumbOffset = Math.max(0, Math.min(verticalMetrics.trackLength, thumbOffset))
+
+    if (verticalMetrics.contentScrollRange <= 0 && verticalMetrics.overscrollScrollRange > 0) {
+      if (verticalMetrics.overscrollTrackLength <= 0) return 0
+      return (clampedThumbOffset / verticalMetrics.overscrollTrackLength) * verticalMetrics.overscrollScrollRange
+    }
+
+    if (verticalMetrics.overscrollScrollRange > 0 && clampedThumbOffset > verticalMetrics.contentTrackLength) {
+      if (verticalMetrics.overscrollTrackLength <= 0) return verticalMetrics.contentScrollRange
+      const overscrollThumbOffset = clampedThumbOffset - verticalMetrics.contentTrackLength
+      const overscrollRatio = overscrollThumbOffset / verticalMetrics.overscrollTrackLength
+      return verticalMetrics.contentScrollRange + overscrollRatio * verticalMetrics.overscrollScrollRange
+    }
+
+    if (verticalMetrics.contentTrackLength <= 0) return 0
+    return (clampedThumbOffset / verticalMetrics.contentTrackLength) * verticalMetrics.contentScrollRange
+  }
+
+  const getThumbOffsetFromScrollY = (scrollY: number, verticalMetrics: NonNullable<ReturnType<
+    typeof getVerticalScrollbarMetrics
+  >>): number => {
+    const fullScrollRange = Math.max(0, -verticalMetrics.scrollHeight)
+    const scrollOffset = Math.max(0, Math.min(fullScrollRange, -scrollY))
+
+    if (verticalMetrics.contentScrollRange <= 0 && verticalMetrics.overscrollScrollRange > 0) {
+      if (verticalMetrics.overscrollScrollRange <= 0) return 0
+      return (scrollOffset / verticalMetrics.overscrollScrollRange) * verticalMetrics.overscrollTrackLength
+    }
+
+    if (verticalMetrics.overscrollScrollRange > 0 && verticalMetrics.contentScrollRange > 0
+      && scrollOffset > verticalMetrics.contentScrollRange)
+    {
+      const overscrollOffset = scrollOffset - verticalMetrics.contentScrollRange
+      const overscrollRatio = verticalMetrics.overscrollScrollRange > 0
+        ? overscrollOffset / verticalMetrics.overscrollScrollRange
+        : 0
+      return verticalMetrics.contentTrackLength + overscrollRatio * verticalMetrics.overscrollTrackLength
+    }
+
+    if (verticalMetrics.contentScrollRange <= 0) return 0
+    return (scrollOffset / verticalMetrics.contentScrollRange) * verticalMetrics.contentTrackLength
+  }
+
   const handleMouseMove = (x: number, y: number) => {
     if (!isDragging.value || !dragType) return
 
@@ -83,16 +131,11 @@ export function createScrollbars(canvas: Canvas, scroll: Scroll, lines: Lines, s
       )
       if (verticalMetrics) {
         const dragDelta = y - dragStartY
-        const trackLength = verticalMetrics.thumbTrackHeight - verticalMetrics.thumbHeight
-        const scrollRange = -verticalMetrics.scrollHeight
-        if (trackLength > 0 && scrollRange > 0) {
-          const scrollRatio = dragDelta / trackLength
-          const nextScrollY = Math.max(
-            layout.scrollHeight,
-            Math.min(0, dragStartScrollY - scrollRatio * scrollRange),
-          )
-          scroll.targetY.value = nextScrollY
-        }
+        const dragStartThumbOffset = getThumbOffsetFromScrollY(dragStartScrollY, verticalMetrics)
+        const nextThumbOffset = dragStartThumbOffset + dragDelta
+        const nextScrollOffset = getScrollOffsetFromThumbOffset(nextThumbOffset, verticalMetrics)
+        const nextScrollY = Math.max(layout.scrollHeight, Math.min(0, -nextScrollOffset))
+        scroll.targetY.value = nextScrollY
       }
     }
     else if (dragType === 'horizontal') {
@@ -135,24 +178,19 @@ export function createScrollbars(canvas: Canvas, scroll: Scroll, lines: Lines, s
           doc.lines.length,
         )
         if (verticalMetrics) {
-          const trackLength = verticalMetrics.thumbTrackHeight - verticalMetrics.thumbHeight
-          const scrollRange = -verticalMetrics.scrollHeight
-          if (trackLength > 0 && scrollRange > 0) {
-            const clickRatio = (y - verticalMetrics.trackY - verticalMetrics.thumbHeight / 2) / trackLength
-            const clampedRatio = Math.max(0, Math.min(1, clickRatio))
-            const newScrollY = -clampedRatio * scrollRange
-            const thumbCenterY = verticalMetrics.trackY
-              + clampedRatio * trackLength
-              + verticalMetrics.thumbHeight / 2
-            scroll.targetY.value = newScrollY
-            isDragging.value = true
-            dragType = 'vertical'
-            dragStartX = x
-            dragStartY = thumbCenterY
-            dragStartScrollX = scroll.targetX.value
-            dragStartScrollY = newScrollY
-            return true
-          }
+          const thumbTopOffset = y - verticalMetrics.thumbTrackY - verticalMetrics.thumbHeight / 2
+          const nextScrollOffset = getScrollOffsetFromThumbOffset(thumbTopOffset, verticalMetrics)
+          const newScrollY = Math.max(layout.scrollHeight, Math.min(0, -nextScrollOffset))
+          const clampedThumbTopOffset = Math.max(0, Math.min(verticalMetrics.trackLength, thumbTopOffset))
+          const thumbCenterY = verticalMetrics.thumbTrackY + clampedThumbTopOffset + verticalMetrics.thumbHeight / 2
+          scroll.targetY.value = newScrollY
+          isDragging.value = true
+          dragType = 'vertical'
+          dragStartX = x
+          dragStartY = thumbCenterY
+          dragStartScrollX = scroll.targetX.value
+          dragStartScrollY = newScrollY
+          return true
         }
       }
       else if (hit.type === 'horizontal') {
