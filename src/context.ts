@@ -55,6 +55,7 @@ export function createContext(editorSettings: Partial<EditorSettings>, doc: Doc,
   const selection = createSelection()
   let pinnedError: DocError | null = null
   let tooltipDismissed = false
+  let docIdentity: unknown = doc
   const notifyActivated = () => activeEditorOpts?.setActiveEditor(activeEditorOpts.editorRef.current)
   const mouse = createMouse(canvas, scroll, lines, settings, caches, doc, caret, scrollbars, selection, gutter, blocks,
     header, notifyActivated)
@@ -84,6 +85,12 @@ export function createContext(editorSettings: Partial<EditorSettings>, doc: Doc,
   return {
     settings,
     doc,
+    get docIdentity() {
+      return docIdentity
+    },
+    set docIdentity(value) {
+      docIdentity = value
+    },
     get pinnedError() {
       return pinnedError
     },

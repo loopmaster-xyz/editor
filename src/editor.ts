@@ -3,6 +3,7 @@ import { BufferOpType } from './buffer.ts'
 import type { Canvas } from './canvas.ts'
 import { createContext, Position } from './context.ts'
 import { createDoc, type Doc } from './doc.ts'
+import { invalidateBlockRenderState } from './draw/blocks.ts'
 import { HORIZONTAL_SCROLLBAR_SIZE, invalidateMinimapRenderState } from './draw/scrollbar.ts'
 import { activeEditor as activeEditorSignal, setActiveEditor } from './editor-state.ts'
 import { disposables } from './lib/disposables.ts'
@@ -53,6 +54,7 @@ export function createEditor(settings: Partial<EditorSettings> = {}) {
 
   let isEditorReady = false
   let pendingDoc: Doc | null = null
+  let activeDocIdentity: Doc = doc
 
   const docEffects = disposables()
 
@@ -65,12 +67,38 @@ export function createEditor(settings: Partial<EditorSettings> = {}) {
 
     void warmup(context, newDoc.tokenLines).catch(error => console.error(error))
 
+    context.caches.saveStateForDoc(activeDocIdentity)
+    context.docIdentity = newDoc
+    context.caches.restoreStateForDoc(newDoc)
+    context.caches.clearDrawCaches()
+    context.lines.resetLayoutCache()
+
+    const tokenLinesSnapshot = newDoc.tokenLines.map(line => line.slice())
+    const tokenStatesSnapshot = newDoc.tokenStates.slice()
+
     batch(() => {
       doc.tokenize = newDoc.tokenize
       doc.buffer.code.value = newDoc.buffer.code.value
       doc.buffer.history.value = newDoc.buffer.history.value
       doc.buffer.index.value = newDoc.buffer.index.value
+      doc.revision = newDoc.revision
+      doc.epoch = newDoc.epoch
+      doc.tokenLines = tokenLinesSnapshot
+      doc.tokenStates = tokenStatesSnapshot
+      doc.tokenVersion = newDoc.tokenVersion
+      doc.tokenizationPending = newDoc.tokenizationPending
+      doc.keyHoldActive = newDoc.keyHoldActive
+      doc.widgets = newDoc.widgets
+      doc.errors = newDoc.errors
+      doc.collapsed = newDoc.collapsed
+      Object.assign(doc.caret, newDoc.caret)
+      Object.assign(doc.scroll, newDoc.scroll)
+      Object.assign(doc.selection, newDoc.selection)
     })
+    context.pinnedError = newDoc.errors[0] ?? null
+    activeDocIdentity = newDoc
+    context.blocks.restoreStateForDoc()
+    invalidateBlockRenderState(context)
     invalidateMinimapRenderState(context)
 
     effects.push(

@@ -17,6 +17,7 @@ interface OptimisticViewportSnapshot {
 }
 
 interface OptimisticSnapshotCacheEntry {
+  docIdentity: unknown
   revision: number
   tokenVersion: number
   startLine: number
@@ -25,6 +26,10 @@ interface OptimisticSnapshotCacheEntry {
 }
 
 const optimisticSnapshotCacheByContext = new WeakMap<Context, OptimisticSnapshotCacheEntry>()
+
+export function invalidateBlockRenderState(context: Context) {
+  optimisticSnapshotCacheByContext.delete(context)
+}
 
 function upperBound(sorted: number[], target: number): number {
   let low = 0
@@ -225,6 +230,8 @@ export function drawBlocks(context: Context) {
   const visibleLinesArray = Array.from(visibleLogicalLines).sort((a, b) => a - b)
   const firstVisibleLogicalLine = visibleLinesArray[0]
   const lastVisibleLogicalLine = visibleLinesArray[visibleLinesArray.length - 1]
+  const visibleContentTop = visibleTop - scrollY
+  const visibleContentBottom = canvasHeight - scrollY
 
   let optimisticSnapshot: OptimisticViewportSnapshot | null = null
   const now = Date.now()
@@ -243,6 +250,7 @@ export function drawBlocks(context: Context) {
       if (
         !shouldBypassOptimisticCache
         && cachedOptimistic
+        && cachedOptimistic.docIdentity === context.docIdentity
         && cachedOptimistic.revision === doc.revision
         && cachedOptimistic.tokenVersion === doc.tokenVersion
         && cachedOptimistic.startLine === optimisticStartLine
@@ -257,6 +265,7 @@ export function drawBlocks(context: Context) {
           optimisticEndLine,
         )
         optimisticSnapshotCacheByContext.set(context, {
+          docIdentity: context.docIdentity,
           revision: doc.revision,
           tokenVersion: doc.tokenVersion,
           startLine: optimisticStartLine,
@@ -533,6 +542,13 @@ export function drawBlocks(context: Context) {
     const startYCanvas = startY + scrollY
     const endYCanvas = endY + scrollY
     if (endYCanvas < visibleTop || startYCanvas > canvasHeight) return
+    let clampedStartY = Math.max(startY, visibleContentTop)
+    let clampedEndY = Math.min(endY, visibleContentBottom)
+    if (clampedEndY < clampedStartY) {
+      const pinnedY = Math.max(visibleContentTop, Math.min(visibleContentBottom, clampedStartY))
+      clampedStartY = pinnedY
+      clampedEndY = pinnedY + Math.max(1, LINE_WIDTH)
+    }
 
     if (hasMatchingBrace) {
       didDrawMatchingMultilineGuide = true
@@ -545,11 +561,11 @@ export function drawBlocks(context: Context) {
     }
 
     c.beginPath()
-    c.moveTo(x, endY)
-    c.lineTo(x, startY)
+    c.moveTo(x, clampedEndY)
+    c.lineTo(x, clampedStartY)
 
     if (hasMatchingBrace) {
-      if (matchingBrace.line === startLine) {
+      if (matchingBrace.line === startLine && clampedStartY === startY) {
         let braceColumn = 0
         for (let i = 0; i < matchingBrace.tokenIndex; i++) {
           braceColumn += tokenLines[matchingBrace.line][i]?.text.length || 0
@@ -592,23 +608,33 @@ export function drawBlocks(context: Context) {
       const startYCanvas = startY + scrollY
       const endYCanvas = endY + scrollY
       if (!(endYCanvas < visibleTop || startYCanvas > canvasHeight)) {
-        let braceColumn = 0
-        for (let i = 0; i < matchingBrace.tokenIndex; i++) {
-          braceColumn += tokenLines[matchingBrace.line][i]?.text.length || 0
-        }
-        braceColumn += matchingBrace.charIndex
+        const clampedStartY = Math.max(startY, visibleContentTop)
+        const clampedEndY = Math.min(endY, visibleContentBottom)
+        if (clampedEndY >= clampedStartY || Math.abs(clampedEndY - clampedStartY) <= 1) {
+          const guideStartY = clampedEndY >= clampedStartY
+            ? clampedStartY
+            : Math.max(visibleContentTop, Math.min(visibleContentBottom, clampedStartY))
+          const guideEndY = clampedEndY >= clampedStartY
+            ? clampedEndY
+            : guideStartY + Math.max(1, LINE_WIDTH)
+          let braceColumn = 0
+          for (let i = 0; i < matchingBrace.tokenIndex; i++) {
+            braceColumn += tokenLines[matchingBrace.line][i]?.text.length || 0
+          }
+          braceColumn += matchingBrace.charIndex
 
-        const braceVisualLine = findVisualLineForColumn(lines, matchingBrace.line, braceColumn, tokenLines, caches)
-        c.strokeStyle = blockColors[matchingBrace.depth % blockColors.length]
-        c.globalAlpha = OPACITY_HIGHLIGHT
-        c.beginPath()
-        c.moveTo(x, endY)
-        c.lineTo(x, startY)
-        if (braceVisualLine) {
-          const braceX = getXFromColumn(lines, braceVisualLine, braceColumn, tokenLines, canvas, settings, caches)
-          c.lineTo(braceX, startY)
+          const braceVisualLine = findVisualLineForColumn(lines, matchingBrace.line, braceColumn, tokenLines, caches)
+          c.strokeStyle = blockColors[matchingBrace.depth % blockColors.length]
+          c.globalAlpha = OPACITY_HIGHLIGHT
+          c.beginPath()
+          c.moveTo(x, guideEndY)
+          c.lineTo(x, guideStartY)
+          if (braceVisualLine && guideStartY === startY) {
+            const braceX = getXFromColumn(lines, braceVisualLine, braceColumn, tokenLines, canvas, settings, caches)
+            c.lineTo(braceX, startY)
+          }
+          c.stroke()
         }
-        c.stroke()
       }
     }
   }

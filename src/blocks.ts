@@ -932,6 +932,8 @@ export function createBlocks(doc: Doc, caches: Caches) {
   let lastScrollActivityAt = 0
   let disposeScrollActivityObserver: (() => void) | null = null
   const debouncedBraceTokenVersion = signal(-1)
+  const braceSnapshotGeneration = signal(0)
+  const blockTopologyGeneration = signal(0)
   const pendingLineTransforms: LineTransform[] = []
   let pendingLineTransformsVersion = 0
   let staleLookupCacheStamp = ''
@@ -975,6 +977,32 @@ export function createBlocks(doc: Doc, caches: Caches) {
     lastStableBraceTokenVersion = tokenVersion
     debouncedBraceTokenVersion.value = tokenVersion
     resetPendingLineTransforms()
+    braceSnapshotGeneration.value++
+  }
+
+  const cancelPendingBraceRebuildWork = () => {
+    if (braceRebuildTimer !== null) {
+      clearTimeout(braceRebuildTimer)
+      braceRebuildTimer = null
+    }
+    if (braceWorkerFlushTimer !== null) {
+      clearTimeout(braceWorkerFlushTimer)
+      braceWorkerFlushTimer = null
+    }
+    activeBraceWorkerJob = null
+    queuedBraceWorkerTokenVersion = null
+  }
+
+  const restoreStateForDoc = () => {
+    cancelPendingBraceRebuildWork()
+
+    blockTopologyGeneration.value++
+
+    // Always rebind brace topology to the currently active document snapshot.
+    // This avoids cross-doc guide leakage if version counters happen to align.
+    publishStableBraceCache(doc.tokenVersion, buildBraceCache(doc.tokenLines, doc.tokenVersion))
+
+    caches.matchingBraceCache.clear()
   }
 
   const shouldUseBraceWorker = () => {
@@ -1251,16 +1279,7 @@ export function createBlocks(doc: Doc, caches: Caches) {
 
   doc.onIncrementalChange(change => {
     if (change.source === 'reset') {
-      if (braceRebuildTimer !== null) {
-        clearTimeout(braceRebuildTimer)
-        braceRebuildTimer = null
-      }
-      if (braceWorkerFlushTimer !== null) {
-        clearTimeout(braceWorkerFlushTimer)
-        braceWorkerFlushTimer = null
-      }
-      activeBraceWorkerJob = null
-      queuedBraceWorkerTokenVersion = null
+      cancelPendingBraceRebuildWork()
       const tokenVersion = doc.tokenVersion
       publishStableBraceCache(tokenVersion, buildBraceCache(doc.tokenLines, tokenVersion))
       return
@@ -1349,6 +1368,8 @@ export function createBlocks(doc: Doc, caches: Caches) {
   })
 
   const indentBlockRanges = computed(() => {
+    blockTopologyGeneration.value
+    doc.revision
     return computeBlockRanges(doc.lines)
   })
 
@@ -1357,6 +1378,7 @@ export function createBlocks(doc: Doc, caches: Caches) {
     const indentRanges = indentBlockRanges.value
     // Avoid applying stale brace-derived ranges while edits are in flight; draw uses viewport-optimistic fallback then.
     debouncedBraceTokenVersion.value
+    braceSnapshotGeneration.value
     const canMergeBraceRanges = lastStableBraceTokenVersion >= 0 && lastStableBraceTokenVersion === doc.tokenVersion
     if (!canMergeBraceRanges) return indentRanges
     return mergeBraceMultilineBlockRanges(indentRanges, lastStableBraceCache, codeLines.length)
@@ -1417,6 +1439,7 @@ export function createBlocks(doc: Doc, caches: Caches) {
     // Rebuilds happen asynchronously (or debounced sync fallback) and publish through `publishStableBraceCache`.
     doc.tokenVersion
     debouncedBraceTokenVersion.value
+    braceSnapshotGeneration.value
     return lastStableBraceCache
   })
 
@@ -1842,20 +1865,11 @@ export function createBlocks(doc: Doc, caches: Caches) {
   }
 
   const dispose = () => {
-    if (braceRebuildTimer !== null) {
-      clearTimeout(braceRebuildTimer)
-      braceRebuildTimer = null
-    }
-    if (braceWorkerFlushTimer !== null) {
-      clearTimeout(braceWorkerFlushTimer)
-      braceWorkerFlushTimer = null
-    }
+    cancelPendingBraceRebuildWork()
     if (disposeScrollActivityObserver) {
       disposeScrollActivityObserver()
       disposeScrollActivityObserver = null
     }
-    activeBraceWorkerJob = null
-    queuedBraceWorkerTokenVersion = null
     if (braceWorker) {
       braceWorker.terminate()
       braceWorker = null
@@ -1884,6 +1898,7 @@ export function createBlocks(doc: Doc, caches: Caches) {
     isBraceAnalysisCurrent,
     getBraceAnalysisVersion,
     setScrollSource,
+    restoreStateForDoc,
     debugBraceProbe,
     dispose,
   }

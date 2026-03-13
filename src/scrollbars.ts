@@ -67,12 +67,57 @@ export function createScrollbars(canvas: Canvas, scroll: Scroll, lines: Lines, s
     return { trackWidth, thumbWidth }
   }
 
+  const getVerticalMetricsAtScrollY = (scrollY: number) => getVerticalScrollbarMetrics(
+    canvas,
+    scroll,
+    lines,
+    settings,
+    gutter,
+    header,
+    doc.lines.length,
+    scrollY,
+  )
+
+  const getRenderedThumbOffsetAtScrollY = (scrollY: number) => {
+    const metrics = getVerticalMetricsAtScrollY(scrollY)
+    return metrics ? metrics.thumbY - metrics.thumbTrackY : 0
+  }
+
+  const getMinimapScrollOffsetFromRenderedThumbOffset = (
+    thumbOffset: number,
+    verticalMetrics: NonNullable<ReturnType<typeof getVerticalScrollbarMetrics>>,
+  ): number => {
+    const fullScrollRange = Math.max(0, -verticalMetrics.scrollHeight)
+    if (fullScrollRange <= 0) return 0
+
+    const maxThumbOffset = getRenderedThumbOffsetAtScrollY(-fullScrollRange)
+    const clampedTarget = Math.max(0, Math.min(maxThumbOffset, thumbOffset))
+
+    let low = 0
+    let high = fullScrollRange
+
+    for (let i = 0; i < 18; i++) {
+      const mid = (low + high) / 2
+      const midThumbOffset = getRenderedThumbOffsetAtScrollY(-mid)
+      if (midThumbOffset < clampedTarget) low = mid
+      else high = mid
+    }
+
+    const lowThumbOffset = getRenderedThumbOffsetAtScrollY(-low)
+    const highThumbOffset = getRenderedThumbOffsetAtScrollY(-high)
+    return Math.abs(lowThumbOffset - clampedTarget) <= Math.abs(highThumbOffset - clampedTarget) ? low : high
+  }
+
   const getScrollOffsetFromThumbOffset = (thumbOffset: number, verticalMetrics: NonNullable<ReturnType<
     typeof getVerticalScrollbarMetrics
   >>): number => {
     const fullScrollRange = Math.max(0, -verticalMetrics.scrollHeight)
     if (fullScrollRange <= 0) return 0
     const clampedThumbOffset = Math.max(0, Math.min(verticalMetrics.trackLength, thumbOffset))
+
+    if (verticalMetrics.isMinimap) {
+      return getMinimapScrollOffsetFromRenderedThumbOffset(clampedThumbOffset, verticalMetrics)
+    }
 
     if (verticalMetrics.contentScrollRange <= 0 && verticalMetrics.overscrollScrollRange > 0) {
       if (verticalMetrics.overscrollTrackLength <= 0) return 0
@@ -95,6 +140,10 @@ export function createScrollbars(canvas: Canvas, scroll: Scroll, lines: Lines, s
   >>): number => {
     const fullScrollRange = Math.max(0, -verticalMetrics.scrollHeight)
     const scrollOffset = Math.max(0, Math.min(fullScrollRange, -scrollY))
+
+    if (verticalMetrics.isMinimap) {
+      return getRenderedThumbOffsetAtScrollY(-scrollOffset)
+    }
 
     if (verticalMetrics.contentScrollRange <= 0 && verticalMetrics.overscrollScrollRange > 0) {
       if (verticalMetrics.overscrollScrollRange <= 0) return 0
@@ -131,7 +180,19 @@ export function createScrollbars(canvas: Canvas, scroll: Scroll, lines: Lines, s
       )
       if (verticalMetrics) {
         const dragDelta = y - dragStartY
-        const dragStartThumbOffset = getThumbOffsetFromScrollY(dragStartScrollY, verticalMetrics)
+        const dragStartMetrics = getVerticalScrollbarMetrics(
+          canvas,
+          scroll,
+          lines,
+          settings,
+          gutter,
+          header,
+          doc.lines.length,
+          dragStartScrollY,
+        )
+        const dragStartThumbOffset = dragStartMetrics
+          ? dragStartMetrics.thumbY - dragStartMetrics.thumbTrackY
+          : getThumbOffsetFromScrollY(dragStartScrollY, verticalMetrics)
         const nextThumbOffset = dragStartThumbOffset + dragDelta
         const nextScrollOffset = getScrollOffsetFromThumbOffset(nextThumbOffset, verticalMetrics)
         const nextScrollY = Math.max(layout.scrollHeight, Math.min(0, -nextScrollOffset))
@@ -156,6 +217,7 @@ export function createScrollbars(canvas: Canvas, scroll: Scroll, lines: Lines, s
     if (!hit.type) return false
 
     const layout = getLayout()
+    const liveScrollY = scroll.pos.y === Infinity ? scroll.targetY.value : scroll.pos.y
 
     if (hit.type && hit.thumb) {
       isDragging.value = true
@@ -163,7 +225,7 @@ export function createScrollbars(canvas: Canvas, scroll: Scroll, lines: Lines, s
       dragStartX = x
       dragStartY = y
       dragStartScrollX = scroll.targetX.value
-      dragStartScrollY = scroll.targetY.value
+      dragStartScrollY = liveScrollY
       return true
     }
     else if (hit.type && !hit.thumb) {
@@ -176,6 +238,7 @@ export function createScrollbars(canvas: Canvas, scroll: Scroll, lines: Lines, s
           gutter,
           header,
           doc.lines.length,
+          liveScrollY,
         )
         if (verticalMetrics) {
           const thumbTopOffset = y - verticalMetrics.thumbTrackY - verticalMetrics.thumbHeight / 2

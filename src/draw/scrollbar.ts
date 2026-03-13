@@ -21,6 +21,7 @@ export const MINIMAP_SCROLLBAR_SIZE = 64
 export const HORIZONTAL_SCROLLBAR_SIZE = 3
 
 const SCROLLBAR_MIN_THUMB = 20
+const MINIMAP_MIN_THUMB = 1
 const SCROLLBAR_TRACK_COLOR = 'rgba(255, 255, 255, 0.05)'
 const SCROLLBAR_THUMB_COLOR = 'rgba(255, 255, 255, 0.1)'
 const SCROLLBAR_THUMB_HOVER_COLOR = 'rgba(255, 255, 255, 0.2)'
@@ -32,7 +33,7 @@ const MINIMAP_BASE_ROW_HEIGHT = 2
 const MINIMAP_MIN_ROW_HEIGHT = 1
 const MINIMAP_DENSITY_RANGE = 1
 const MINIMAP_MAX_VIRTUAL_ROWS = 3000
-const MINIMAP_MAX_COMPRESSED_LINES_PER_ROW = 1
+const MINIMAP_MAX_COMPRESSED_LINES_PER_ROW = 2
 const MINIMAP_BITMAP_ROW_SCALE = 1
 const MINIMAP_BURST_WINDOW_MS = 120
 const MINIMAP_WORKER_THROTTLE_BURST_MS = 120
@@ -72,6 +73,8 @@ type ScrollbarLayout = {
   height: number
   totalWidth: number
   totalHeight: number
+  lineHeight: number
+  paddingTop: number
   scrollWidth: number
   scrollHeight: number
   scrollX: number
@@ -125,6 +128,25 @@ type MinimapSurface = {
 type MinimapSnapshot = {
   sourceY: number
   sourceHeight: number
+}
+
+type MinimapViewportModel = {
+  modelBaseHeight: number
+  viewportHeight: number
+  lineCount: number
+  fullScrollRange: number
+  contentScrollRange: number
+  overscrollScrollRange: number
+  scrollOffset: number
+  contentHeightRatio: number
+  fullMinimapHeight: number
+  trackLength: number
+  thumbHeight: number
+  thumbOffset: number
+  contentTrackLength: number
+  overscrollTrackLength: number
+  sourceY: number
+  minimapMetrics: ReturnType<typeof getMinimapViewportMetrics>
 }
 
 type MinimapRenderState = {
@@ -1215,6 +1237,15 @@ export interface ScrollbarHit {
 }
 
 export interface VerticalScrollbarMetrics {
+  isMinimap: boolean
+  modelBaseHeight: number
+  viewportHeight: number
+  minimapMode: 'compressed' | 'windowed' | null
+  minimapLineSpan: number
+  minimapSourceHeight: number
+  minimapDrawHeight: number
+  minimapSourceY: number
+  minimapTotalSourceRows: number
   scrollbarX: number
   trackY: number
   trackHeight: number
@@ -1246,6 +1277,8 @@ function getScrollbarLayout(
   const height = canvas.size.height.value
   const totalWidth = lines.totalWidth.value
   const totalHeight = lines.totalHeight.value
+  const lineHeight = settings.lineHeight
+  const paddingTop = settings.paddingTop
   const scrollWidth = scroll.scrollWidth.value
   const scrollHeight = scroll.scrollHeight.value
   const scrollX = scroll.targetX.value
@@ -1265,6 +1298,8 @@ function getScrollbarLayout(
     height,
     totalWidth,
     totalHeight,
+    lineHeight,
+    paddingTop,
     scrollWidth,
     scrollHeight,
     scrollX,
@@ -1331,6 +1366,42 @@ function getMinimapViewportMetrics(
   }
 }
 
+function getVisibleLogicalViewportRange(
+  lines: Lines,
+  layout: ScrollbarLayout,
+  scrollY: number,
+  lineCount: number,
+) {
+  if (lineCount <= 0) return { start: 0, endExclusive: 0, span: 0 }
+
+  const visibleTop = -layout.headerHeight - layout.paddingTop
+  const visibleBottom = layout.height - layout.paddingTop
+
+  if (typeof lines.getApproxVisibleLogicalRange === 'function') {
+    const approx = lines.getApproxVisibleLogicalRange(visibleTop, visibleBottom, scrollY)
+    if (approx) {
+      const start = Math.max(0, Math.min(lineCount - 1, approx.start))
+      const endExclusive = Math.max(start + 1, Math.min(lineCount, approx.end + 1))
+      return { start, endExclusive, span: Math.max(1, endExclusive - start) }
+    }
+  }
+
+  const visibleVisualLines = lines.getVisibleVisualLines(visibleTop, visibleBottom, scrollY)
+  if (visibleVisualLines.length === 0) return { start: 0, endExclusive: Math.min(1, lineCount), span: Math.min(1, lineCount) }
+
+  let start = lineCount - 1
+  let end = 0
+  for (let i = 0; i < visibleVisualLines.length; i++) {
+    const logicalLine = visibleVisualLines[i].logicalLine
+    if (logicalLine < start) start = logicalLine
+    if (logicalLine > end) end = logicalLine
+  }
+
+  const clampedStart = Math.max(0, Math.min(lineCount - 1, start))
+  const endExclusive = Math.max(clampedStart + 1, Math.min(lineCount, end + 1))
+  return { start: clampedStart, endExclusive, span: Math.max(1, endExclusive - clampedStart) }
+}
+
 export function getMinimapTrackHeightForLineCount(
   lineCountInput: number,
   fullTrackHeight: number,
@@ -1344,13 +1415,103 @@ export function getMinimapTrackHeightForLineCount(
     canvasDpr,
   )
   return Math.max(
-    SCROLLBAR_MIN_THUMB,
+    MINIMAP_MIN_THUMB,
     Math.min(fullTrackHeight, drawHeight + MINIMAP_INNER_PADDING * 2),
   )
 }
 
+function getMinimapViewportModel(
+  layout: ScrollbarLayout,
+  lines: Lines,
+  scrollY = layout.scrollY,
+  minimapLineCount?: number,
+  canvasDpr = 1,
+): MinimapViewportModel {
+  const lineCount = Math.max(1, minimapLineCount ?? 1)
+  const devicePixelScale = Math.max(1, canvasDpr)
+  const alignToDevicePixels = (value: number) => Math.round(value * devicePixelScale) / devicePixelScale
+  const fullMinimapHeight = Math.max(
+    1 / devicePixelScale,
+    alignToDevicePixels(layout.height - MINIMAP_INNER_PADDING * 2),
+  )
+  const fullScrollRange = Math.max(0, -layout.scrollHeight)
+  const contentScrollRange = Math.max(0, layout.totalHeight - layout.availableHeight)
+  const scrollOffset = Math.max(0, Math.min(fullScrollRange, -scrollY))
+  const blankViewportHeight = Math.max(0, scrollOffset + layout.availableHeight - layout.totalHeight)
+  const overscrollScrollRange = Math.max(0, fullScrollRange - contentScrollRange)
+  const currentModelHeight = Math.max(1, layout.totalHeight + blankViewportHeight)
+  const modelBaseHeight = Math.max(1, currentModelHeight - Math.max(0, scrollOffset - contentScrollRange))
+  const contentHeightRatio = Math.max(0, Math.min(1, layout.totalHeight / currentModelHeight))
+  const minimapMetrics = getMinimapViewportMetrics(
+    lineCount,
+    layout.height,
+    layout.verticalScrollbarSize,
+    canvasDpr,
+    contentHeightRatio,
+  )
+  const { geometry, sourceHeight, drawHeight } = minimapMetrics
+  const visibleLogicalRange = getVisibleLogicalViewportRange(lines, layout, scrollY, lineCount)
+  const sourceRowsPerVisualLine = geometry.totalSourceRows / Math.max(1, lineCount)
+  const viewportSourceStart = visibleLogicalRange.start * sourceRowsPerVisualLine
+  const viewportSourceHeight = Math.max(
+    sourceRowsPerVisualLine,
+    visibleLogicalRange.span * sourceRowsPerVisualLine,
+  )
+  const maxSourceY = Math.max(0, geometry.totalSourceRows - sourceHeight)
+  const maxViewportSourceStart = Math.max(0, geometry.totalSourceRows - viewportSourceHeight)
+  const sourceY = maxViewportSourceStart > 0
+    ? Math.max(
+        0,
+        Math.min(
+          maxSourceY,
+          (viewportSourceStart / maxViewportSourceStart) * maxSourceY,
+        ),
+      )
+    : 0
+  const viewportSourceEnd = Math.min(geometry.totalSourceRows, viewportSourceStart + viewportSourceHeight)
+  const contentSliceStart = Math.max(0, Math.min(sourceHeight, viewportSourceStart - sourceY))
+  const contentSliceEnd = Math.max(0, Math.min(sourceHeight, viewportSourceEnd - sourceY))
+  const contentThumbOffset = sourceHeight > 0 ? (contentSliceStart / sourceHeight) * drawHeight : 0
+  const contentThumbHeight = sourceHeight > 0
+    ? ((Math.max(contentSliceStart, contentSliceEnd) - Math.min(contentSliceStart, contentSliceEnd)) / sourceHeight)
+      * drawHeight
+    : drawHeight
+  const blankTrackHeight = Math.max(0, fullMinimapHeight - drawHeight)
+  const thumbHeight = Math.min(
+    fullMinimapHeight,
+    Math.max(
+      MINIMAP_MIN_THUMB,
+      contentThumbHeight + blankTrackHeight,
+    ),
+  )
+  const trackLength = Math.max(0, fullMinimapHeight - thumbHeight)
+  const thumbOffset = Math.max(0, Math.min(trackLength, contentThumbOffset))
+  const contentTrackLength = trackLength
+  const overscrollTrackLength = 0
+
+  return {
+    modelBaseHeight,
+    viewportHeight: layout.availableHeight,
+    lineCount,
+    fullScrollRange,
+    contentScrollRange,
+    overscrollScrollRange,
+    scrollOffset,
+    contentHeightRatio,
+    fullMinimapHeight,
+    trackLength,
+    thumbHeight,
+    thumbOffset,
+    contentTrackLength,
+    overscrollTrackLength,
+    sourceY,
+    minimapMetrics,
+  }
+}
+
 function getVerticalThumbMetrics(
   layout: ScrollbarLayout,
+  lines: Lines,
   scrollY = layout.scrollY,
   minimapLineCount?: number,
   canvasDpr = 1,
@@ -1362,101 +1523,66 @@ function getVerticalThumbMetrics(
   const devicePixelScale = Math.max(1, canvasDpr)
   const alignToDevicePixels = (value: number) => Math.round(value * devicePixelScale) / devicePixelScale
   let thumbTrackY = trackY
-  let thumbAreaHeight = trackHeight
   let thumbTrackHeight = trackHeight
-  let thumbHeightTrackHeight = trackHeight
+  let thumbHeight = trackHeight
+  let trackLength = 0
   let contentTrackLength = 0
   let overscrollTrackLength = 0
-
+  let modelBaseHeight = layout.totalHeight
+  let viewportHeight = layout.availableHeight
+  let minimapMode: 'compressed' | 'windowed' | null = null
+  let minimapLineSpan = 1
+  let minimapSourceHeight = 0
+  let minimapDrawHeight = 0
+  let minimapSourceY = 0
+  let minimapTotalSourceRows = 0
   const fullScrollRange = Math.max(0, -layout.scrollHeight)
   const rawContentScrollRange = Math.max(0, layout.totalHeight - layout.availableHeight)
   const contentScrollRange = isMinimapMode ? rawContentScrollRange : fullScrollRange
   const overscrollScrollRange = isMinimapMode ? Math.max(0, fullScrollRange - rawContentScrollRange) : 0
   const scrollOffset = Math.max(0, Math.min(fullScrollRange, -scrollY))
+  let thumbY = thumbTrackY
 
   if (isMinimapMode) {
-    const fallbackLineCount = Math.max(1, Math.round(layout.totalHeight / 16))
-    const minimapMetrics = getMinimapViewportMetrics(
-      minimapLineCount ?? fallbackLineCount,
-      trackHeight,
-      layout.verticalScrollbarSize,
-      canvasDpr,
-      1,
-    )
-    const fullMinimapHeight = Math.max(
-      1 / devicePixelScale,
-      alignToDevicePixels(trackHeight - MINIMAP_INNER_PADDING * 2),
-    )
+    const viewportModel = getMinimapViewportModel(layout, lines, scrollY, minimapLineCount, canvasDpr)
+    modelBaseHeight = viewportModel.modelBaseHeight
+    viewportHeight = viewportModel.viewportHeight
+    minimapMode = viewportModel.minimapMetrics.geometry.mode
+    minimapLineSpan = viewportModel.minimapMetrics.geometry.lineSpan
+    minimapSourceHeight = viewportModel.minimapMetrics.sourceHeight
+    minimapDrawHeight = viewportModel.minimapMetrics.drawHeight
+    minimapSourceY = viewportModel.sourceY
+    minimapTotalSourceRows = viewportModel.minimapMetrics.geometry.totalSourceRows
     thumbTrackY = alignToDevicePixels(trackY + MINIMAP_INNER_PADDING)
-    // Thumb can travel across the full minimap lane.
-    thumbAreaHeight = fullMinimapHeight
-    // Keep compression geometry stable; visible content translation handles overscroll visualization.
-    thumbHeightTrackHeight = Math.min(fullMinimapHeight, minimapMetrics.drawHeight)
-    thumbTrackHeight = thumbHeightTrackHeight
-  }
-
-  const thumbHeightUnclamped = Math.max(
-    SCROLLBAR_MIN_THUMB,
-    (layout.availableHeight / layout.totalHeight) * thumbHeightTrackHeight,
-  )
-  const thumbHeight = Math.min(thumbHeightTrackHeight, thumbHeightUnclamped)
-  const maxTrackLength = Math.max(0, thumbAreaHeight - thumbHeight)
-  const compressedMinimapEpsilon = 1 / devicePixelScale
-  const isCompressedMinimap = isMinimapMode && thumbTrackHeight >= (thumbAreaHeight - compressedMinimapEpsilon)
-
-  if (isMinimapMode) {
-    const contentVisibleTrackLength = Math.max(0, Math.min(maxTrackLength, thumbTrackHeight - thumbHeight))
-    if (contentScrollRange > 0 && overscrollScrollRange > 0) {
-      if (isCompressedMinimap) {
-        const fullScrollSpan = contentScrollRange + overscrollScrollRange
-        const proportionalContentTrackLength = fullScrollSpan > 0
-          ? (maxTrackLength * contentScrollRange) / fullScrollSpan
-          : maxTrackLength
-        contentTrackLength = Math.max(0, Math.min(maxTrackLength, proportionalContentTrackLength))
-        overscrollTrackLength = Math.max(0, maxTrackLength - contentTrackLength)
-      }
-      else {
-        contentTrackLength = contentVisibleTrackLength
-        const remainingTrackLength = Math.max(0, maxTrackLength - contentTrackLength)
-        const contentScrollSlope = contentTrackLength / contentScrollRange
-        const overscrollTrackLengthUnclamped = overscrollScrollRange * contentScrollSlope
-        overscrollTrackLength = Math.max(
-          0,
-          Math.min(remainingTrackLength, overscrollTrackLengthUnclamped),
-        )
-      }
-    }
-    else {
-      contentTrackLength = contentVisibleTrackLength
-      overscrollTrackLength = 0
-    }
+    thumbTrackHeight = viewportModel.fullMinimapHeight
+    thumbHeight = viewportModel.thumbHeight
+    trackLength = viewportModel.trackLength
+    contentTrackLength = viewportModel.contentTrackLength
+    overscrollTrackLength = viewportModel.overscrollTrackLength
+    thumbY = thumbTrackY + Math.max(0, Math.min(trackLength, viewportModel.thumbOffset))
   }
   else {
-    contentTrackLength = maxTrackLength
+    const thumbHeightUnclamped = Math.max(
+      SCROLLBAR_MIN_THUMB,
+      (layout.availableHeight / layout.totalHeight) * trackHeight,
+    )
+    thumbHeight = Math.min(trackHeight, thumbHeightUnclamped)
+    trackLength = Math.max(0, trackHeight - thumbHeight)
+    contentTrackLength = trackLength
     overscrollTrackLength = 0
+    thumbY = trackY + (contentScrollRange > 0 ? (scrollOffset / contentScrollRange) * contentTrackLength : 0)
   }
-
-  const trackLength = Math.max(0, Math.min(maxTrackLength, contentTrackLength + overscrollTrackLength))
-  let thumbOffset = 0
-
-  if (overscrollScrollRange > 0 && contentScrollRange > 0 && scrollOffset > contentScrollRange) {
-    const overscrollOffset = scrollOffset - contentScrollRange
-    const overscrollRatio = overscrollScrollRange > 0 ? overscrollOffset / overscrollScrollRange : 0
-    thumbOffset = contentTrackLength + overscrollRatio * overscrollTrackLength
-  }
-  else if (contentScrollRange > 0) {
-    const contentRatio = scrollOffset / contentScrollRange
-    thumbOffset = contentRatio * contentTrackLength
-  }
-  else if (overscrollScrollRange > 0) {
-    const overscrollRatio = scrollOffset / overscrollScrollRange
-    thumbOffset = overscrollRatio * overscrollTrackLength
-  }
-
-  const thumbY = thumbTrackY + Math.max(0, Math.min(trackLength, thumbOffset))
-  thumbTrackHeight = thumbHeight + trackLength
 
   return {
+    isMinimap: isMinimapMode,
+    modelBaseHeight,
+    viewportHeight,
+    minimapMode,
+    minimapLineSpan,
+    minimapSourceHeight,
+    minimapDrawHeight,
+    minimapSourceY,
+    minimapTotalSourceRows,
     scrollbarX,
     trackY,
     trackHeight,
@@ -1486,6 +1612,7 @@ export function getVerticalScrollbarMetrics(
   if (!layout.needsVertical) return null
   const metrics = getVerticalThumbMetrics(
     layout,
+    lines,
     scrollYOverride ?? layout.scrollY,
     minimapLineCount,
     canvas.dpr.value,
@@ -1510,6 +1637,7 @@ export function hitTestScrollbar(
   const layout = getScrollbarLayout(canvas, scroll, lines, settings, gutter, header)
 
   if (layout.needsVertical) {
+    const scrollYForHit = scroll.pos.y === Infinity ? layout.scrollY : scroll.pos.y
     const verticalMetrics = getVerticalScrollbarMetrics(
       canvas,
       scroll,
@@ -1518,7 +1646,7 @@ export function hitTestScrollbar(
       gutter,
       header,
       minimapLineCount,
-      layout.scrollY,
+      scrollYForHit,
     )
     if (
       verticalMetrics
@@ -1559,13 +1687,12 @@ export function drawScrollbars(context: Context) {
   const layout = getScrollbarLayout(canvas, scroll, lines, settings, gutter, header)
 
   if (layout.needsVertical) {
-    const liveScrollY = settings.showMinimap
+    const liveScrollY = context.scrollbars.isDragging.value
       ? layout.scrollY
-      : (context.scrollbars.isDragging.value
-          ? layout.scrollY
-          : (scroll.pos.y === Infinity ? layout.scrollY : scroll.pos.y))
-    const { scrollbarX, trackY, trackHeight, thumbHeight, thumbY, overscrollTrackLength } = getVerticalThumbMetrics(
+      : (scroll.pos.y === Infinity ? layout.scrollY : scroll.pos.y)
+    const { scrollbarX, trackY, trackHeight, thumbHeight, thumbY } = getVerticalThumbMetrics(
       layout,
+      lines,
       liveScrollY,
       context.doc.lines.length,
       canvas.dpr.value,
@@ -1580,43 +1707,17 @@ export function drawScrollbars(context: Context) {
       c.fillRect(scrollbarX, trackY, layout.verticalScrollbarSize, fullTrackHeight)
       drawMinimapLeftShadow(c, scrollbarX, trackY, fullTrackHeight)
 
-      const lineCount = Math.max(1, context.doc.lines.length)
-      const fullScrollRangeY = Math.max(0, -layout.scrollHeight)
-      const contentScrollRangeY = Math.max(0, layout.totalHeight - layout.availableHeight)
-      const overscrollScrollRangeY = Math.max(0, fullScrollRangeY - contentScrollRangeY)
-      const scrollOffsetY = Math.max(0, Math.min(fullScrollRangeY, -liveScrollY))
-      const overscrollOffsetY = Math.max(0, scrollOffsetY - contentScrollRangeY)
-      const overscrollProgressY = overscrollScrollRangeY > 0
-        ? Math.max(0, Math.min(1, overscrollOffsetY / overscrollScrollRangeY))
-        : 0
-      const minimapMetrics = getMinimapViewportMetrics(
-        lineCount,
-        trackHeight,
-        layout.verticalScrollbarSize,
-        canvasDpr,
-        1,
-      )
+      const viewportModel = getMinimapViewportModel(layout, lines, liveScrollY, context.doc.lines.length, canvasDpr)
       const minimapX = alignToDevicePixels(scrollbarX + MINIMAP_INNER_PADDING)
       const minimapY = alignToDevicePixels(trackY + MINIMAP_INNER_PADDING)
-      const { geometry, sourceHeight, drawHeight, minimapPixelScale } = minimapMetrics
-      const fullMinimapHeight = Math.max(
-        1 / canvasDpr,
-        alignToDevicePixels(trackHeight - MINIMAP_INNER_PADDING * 2),
+      const { geometry, sourceHeight, drawHeight, minimapPixelScale } = viewportModel.minimapMetrics
+      const sourceY = viewportModel.sourceY
+      const compression = buildCompressionState(
+        viewportModel.lineCount,
+        geometry,
+        sourceHeight,
+        minimapPixelScale,
       )
-      const isCompressedMinimap = drawHeight >= fullMinimapHeight - (1 / canvasDpr)
-      const overscrollVisualMaxShift = isCompressedMinimap && overscrollScrollRangeY > 0
-        ? alignToDevicePixels(Math.min(drawHeight, Math.max(0, overscrollTrackLength)))
-        : 0
-      const overscrollVisualShift = alignToDevicePixels(overscrollProgressY * overscrollVisualMaxShift)
-      const minimapDrawY = minimapY - overscrollVisualShift
-
-      // Overscroll is blank space after the real content; keep the minimap content pinned at EOF.
-      const contentScrollOffsetY = Math.min(scrollOffsetY, contentScrollRangeY)
-      const scrollRatioY = contentScrollRangeY > 0 ? contentScrollOffsetY / contentScrollRangeY : 0
-      const maxSourceY = Math.max(0, geometry.totalSourceRows - sourceHeight)
-      const sourceY = Math.max(0, Math.min(maxSourceY, Math.floor(scrollRatioY * maxSourceY)))
-
-      const compression = buildCompressionState(lineCount, geometry, sourceHeight, minimapPixelScale)
       // Draw at the exact CSS size that maps to the source pixel crop to avoid stretch blits.
       const drawWidth = Math.max(1, compression.pixelColumnCount / compression.pixelScale)
       const theme = getMinimapThemeSnapshot(context)
@@ -1648,7 +1749,7 @@ export function drawScrollbars(context: Context) {
         sourceY,
         sourceHeight,
         minimapX,
-        minimapDrawY,
+        minimapY,
         drawWidth,
         drawHeight,
         theme,
@@ -1656,7 +1757,7 @@ export function drawScrollbars(context: Context) {
 
       if (!drewCached) {
         c.fillStyle = 'rgba(255, 255, 255, 0.02)'
-        c.fillRect(minimapX, minimapDrawY, drawWidth, drawHeight)
+        c.fillRect(minimapX, minimapY, drawWidth, drawHeight)
       }
       c.restore()
 

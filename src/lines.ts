@@ -803,8 +803,21 @@ export function createLines(
   let cachedWidgetsIndex: WidgetsByLogicalLineIndex = { map: new Map(), hasAboveOrFull: false }
   let cachedErrorsRef: DocError[] | null = null
   let cachedErrorsByLine: Map<number, DocError[]> = new Map()
+  const layoutResetVersion = signal(0)
+
+  const resetLayoutCache = () => {
+    previousLayout = null
+    latestCaretLayoutSnapshot = null
+    cachedWidgetsRef = null
+    cachedWidgetsIndex = { map: new Map(), hasAboveOrFull: false }
+    cachedErrorsRef = null
+    cachedErrorsByLine = new Map()
+    incrementalTokenChange.value = null
+    layoutResetVersion.value++
+  }
 
   const visualData = computed<VisualLayoutOutput>(() => {
+    layoutResetVersion.value
     const tokenLines = doc.tokenLines
     const tokenChange = incrementalTokenChange.value
     const widgetsRef = doc.widgets
@@ -1565,5 +1578,5 @@ export function createLines(
 
   return { visualLines, visualLinesByLogicalLine, totalWidth, totalHeight, getVisibleVisualLines,
     getLastVisualLine, getFirstVisualLine, getApproxCaretMetrics, getApproxContentMetrics,
-    getApproxVisibleLogicalRange }
+    getApproxVisibleLogicalRange, resetLayoutCache }
 }
