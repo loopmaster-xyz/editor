@@ -54,9 +54,10 @@ export function createKeyboard(
   const metaKey = signal(false)
   const altKey = signal(false)
   const pressedInputKeys = new Set<string>()
+  const repeatingInputKeys = new Set<string>()
 
   const updateKeyHoldActive = () => {
-    doc.keyHoldActive = pressedInputKeys.size > 0
+    doc.keyHoldActive = repeatingInputKeys.size > 0
   }
 
   function insertText(text: string) {
@@ -2853,7 +2854,9 @@ export function createKeyboard(
         return
       }
 
-      pressedInputKeys.add(event.code || event.key)
+      const inputKeyId = event.code || event.key
+      pressedInputKeys.add(inputKeyId)
+      if (event.repeat) repeatingInputKeys.add(inputKeyId)
       updateKeyHoldActive()
 
       handleKeyAction(event.key, event.shiftKey, event.ctrlKey, event.metaKey, event.altKey)
@@ -2900,12 +2903,15 @@ export function createKeyboard(
         // Some platforms can swallow the paired keyup (e.g. "V" in Ctrl/Cmd+V).
         // Clearing here prevents keyHoldActive from getting stuck until blur.
         pressedInputKeys.clear()
+        repeatingInputKeys.clear()
         updateKeyHoldActive()
         return
       }
 
       if (!NON_KEYS.has(event.key)) {
-        pressedInputKeys.delete(event.code || event.key)
+        const inputKeyId = event.code || event.key
+        pressedInputKeys.delete(inputKeyId)
+        repeatingInputKeys.delete(inputKeyId)
         updateKeyHoldActive()
       }
     })
@@ -2924,6 +2930,7 @@ export function createKeyboard(
   const handleTextareaBlur = () => {
     setTimeout(() => {
       pressedInputKeys.clear()
+      repeatingInputKeys.clear()
       updateKeyHoldActive()
       const activeElement = document.activeElement
       const textarea = getTextareaElement()
@@ -2944,6 +2951,7 @@ export function createKeyboard(
 
   const dispose = () => {
     pressedInputKeys.clear()
+    repeatingInputKeys.clear()
     updateKeyHoldActive()
     textarea.removeEventListener('focus', handleTextareaFocus)
     textarea.removeEventListener('blur', handleTextareaBlur)
