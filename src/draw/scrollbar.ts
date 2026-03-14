@@ -261,6 +261,68 @@ function getMinimapBackgroundCss(context: Context, isHovered: boolean): string {
   return `rgba(${background.r}, ${background.g}, ${background.b}, ${alpha})`
 }
 
+function getMinimapSelectionCss(context: Context): string {
+  const selection = parseColorToRgb(context.settings.colors.blue, { r: 80, g: 160, b: 255 })
+  return `rgba(${selection.r}, ${selection.g}, ${selection.b}, 0.32)`
+}
+
+function getMinimapSelectedLineRange(context: Context): { startLine: number; endLineExclusive: number } | null {
+  if (!context.selection.hasSelection.value) return null
+  const ordered = context.selection.getOrdered.value
+  if (!ordered) return null
+
+  const contentLineCount = context.doc.lines.length
+  if (contentLineCount <= 0) return null
+  const startLine = Math.max(0, Math.min(contentLineCount - 1, ordered.start.line))
+  const rawEndLineExclusive = ordered.end.line > ordered.start.line && ordered.end.column === 0
+    ? ordered.end.line
+    : ordered.end.line + 1
+  const endLineExclusive = Math.max(startLine + 1, Math.min(contentLineCount, rawEndLineExclusive))
+
+  if (endLineExclusive <= startLine) return null
+  return { startLine, endLineExclusive }
+}
+
+function drawMinimapSelectionOverlay(
+  context: Context,
+  c: CanvasRenderingContext2D,
+  sourceY: number,
+  sourceHeight: number,
+  drawX: number,
+  drawY: number,
+  drawWidth: number,
+  drawHeight: number,
+  lineSpan: number,
+  rowScale: number,
+  totalSourceRows: number,
+  canvasDpr: number,
+) {
+  const selectedLines = getMinimapSelectedLineRange(context)
+  if (!selectedLines) return
+  if (sourceHeight <= 0 || drawHeight <= 0 || drawWidth <= 0) return
+
+  const selectionSourceStart = Math.max(0, Math.floor(selectedLines.startLine / lineSpan) * rowScale)
+  const selectionSourceEnd = Math.min(
+    totalSourceRows,
+    Math.ceil(selectedLines.endLineExclusive / lineSpan) * rowScale,
+  )
+  if (selectionSourceEnd <= selectionSourceStart) return
+
+  const visibleSelectionStart = Math.max(sourceY, selectionSourceStart)
+  const visibleSelectionEnd = Math.min(sourceY + sourceHeight, selectionSourceEnd)
+  if (visibleSelectionEnd <= visibleSelectionStart) return
+
+  const selectionOffset = ((visibleSelectionStart - sourceY) / sourceHeight) * drawHeight
+  const selectionHeight = ((visibleSelectionEnd - visibleSelectionStart) / sourceHeight) * drawHeight
+  const minSelectionHeight = 1 / Math.max(1, canvasDpr)
+  const clampedHeight = Math.max(minSelectionHeight, selectionHeight)
+  const maxSelectionY = drawY + Math.max(0, drawHeight - clampedHeight)
+  const selectionY = Math.min(maxSelectionY, drawY + selectionOffset)
+
+  c.fillStyle = getMinimapSelectionCss(context)
+  c.fillRect(drawX, selectionY, drawWidth, clampedHeight)
+}
+
 function drawMinimapLeftShadow(c: CanvasRenderingContext2D, x: number, y: number, height: number) {
   const gradient = c.createLinearGradient(x, 0, x - MINIMAP_LEFT_SHADOW_WIDTH, 0)
   gradient.addColorStop(0, `rgba(0, 0, 0, ${MINIMAP_LEFT_SHADOW_ALPHA})`)
@@ -1467,14 +1529,25 @@ function getMinimapViewportModel(
       * drawHeight
     : drawHeight
   const blankTrackHeight = Math.max(0, fullMinimapHeight - drawHeight)
-  const thumbHeight = Math.min(
-    fullMinimapHeight,
-    Math.max(
-      MINIMAP_MIN_THUMB,
-      contentThumbHeight + blankTrackHeight,
-    ),
-  )
-  const trackLength = Math.max(0, fullMinimapHeight - thumbHeight)
+  const usesContentRegionThumbModel = drawHeight < fullMinimapHeight - (1 / devicePixelScale)
+  const thumbHeight = usesContentRegionThumbModel
+    ? Math.min(
+        drawHeight,
+        Math.max(
+          MINIMAP_MIN_THUMB,
+          contentThumbHeight,
+        ),
+      )
+    : Math.min(
+        fullMinimapHeight,
+        Math.max(
+          MINIMAP_MIN_THUMB,
+          contentThumbHeight + blankTrackHeight,
+        ),
+      )
+  const trackLength = usesContentRegionThumbModel
+    ? Math.max(0, drawHeight - thumbHeight)
+    : Math.max(0, fullMinimapHeight - thumbHeight)
   const thumbOffset = Math.max(0, Math.min(trackLength, contentThumbOffset))
   const contentTrackLength = trackLength
   const overscrollTrackLength = 0
@@ -1747,6 +1820,21 @@ export function drawScrollbars(context: Context) {
         c.fillStyle = 'rgba(255, 255, 255, 0.02)'
         c.fillRect(minimapX, minimapY, drawWidth, drawHeight)
       }
+
+      drawMinimapSelectionOverlay(
+        context,
+        c,
+        sourceY,
+        sourceHeightExact,
+        minimapX,
+        minimapY,
+        drawWidth,
+        drawHeight,
+        geometry.lineSpan,
+        geometry.rowScale,
+        geometry.totalSourceRows,
+        canvasDpr,
+      )
       c.restore()
 
       // Keep viewport visuals on the exact same geometry used by minimap drag/hit-testing.
