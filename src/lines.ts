@@ -330,6 +330,20 @@ type InlineWidgetWidthIndex = {
   inlay: Map<number, number>
 }
 
+function measureInlayWidgetWidth(
+  c: CanvasRenderingContext2D,
+  settings: Settings,
+  content: string,
+  fontSize?: string,
+): number {
+  const size = fontSize ?? settings.fontSize
+  c.save()
+  c.font = `400 normal ${size} '${settings.fontFamilyName}', monospace`
+  const width = c.measureText(content).width
+  c.restore()
+  return width
+}
+
 function createInlineWidgetWidthIndex(
   c: CanvasRenderingContext2D,
   settings: Settings,
@@ -349,7 +363,7 @@ function createInlineWidgetWidthIndex(
       after.set(column, (after.get(column) ?? 0) + widget.pos.width)
     }
     else if (widget.type === 'inlay') {
-      const { width: widgetWidth } = measureText(c, settings, caches, { text: widget.content, type: 'text' })
+      const widgetWidth = measureInlayWidgetWidth(c, settings, widget.content, widget.fontSize)
       inlay.set(column, (inlay.get(column) ?? 0) + widgetWidth)
     }
   }
@@ -800,6 +814,7 @@ export function createLines(
   let previousLayout: VisualLayoutCacheState | null = null
   let latestCaretLayoutSnapshot: CaretLayoutSnapshot | null = null
   let cachedWidgetsRef: Widget[] | null = null
+  let cachedWidgetVersion = -1
   let cachedWidgetsIndex: WidgetsByLogicalLineIndex = { map: new Map(), hasAboveOrFull: false }
   let cachedErrorsRef: DocError[] | null = null
   let cachedErrorsByLine: Map<number, DocError[]> = new Map()
@@ -821,6 +836,7 @@ export function createLines(
     const tokenLines = doc.tokenLines
     const tokenChange = incrementalTokenChange.value
     const widgetsRef = doc.widgets
+    const widgetVersion = doc.widgetVersion
     const errorsRef = doc.errors
     const baseAvailableWidth = canvas.size.width.value - settings.paddingLeft - settings.paddingRight
       - metrics.gutterWidth.value
@@ -829,9 +845,10 @@ export function createLines(
       ? baseAvailableWidth - verticalScrollbarSize
       : Infinity
 
-    const widgetsChanged = widgetsRef !== cachedWidgetsRef
+    const widgetsChanged = widgetsRef !== cachedWidgetsRef || widgetVersion !== cachedWidgetVersion
     if (widgetsChanged) {
       cachedWidgetsRef = widgetsRef
+      cachedWidgetVersion = widgetVersion
       cachedWidgetsIndex = buildWidgetsByLogicalLineIndex(widgetsRef)
     }
     const widgetsByLogicalLine = cachedWidgetsIndex.map
@@ -1278,7 +1295,8 @@ export function createLines(
       for (let logicalLine = 0; logicalLine < tokenLines.length; logicalLine++) {
         const wrapped = processedVisualLinesByLogicalLine[logicalLine] ?? []
         const startY = wrapped[0]?.y ?? (logicalLine > 0
-          ? ((processedLineLayouts[logicalLine - 1]?.startY ?? 0) + (processedLineLayouts[logicalLine - 1]?.height ?? 0))
+          ? ((processedLineLayouts[logicalLine - 1]?.startY ?? 0)
+            + (processedLineLayouts[logicalLine - 1]?.height ?? 0))
           : 0)
         const metricsForLine = getVisualLineBlockMetrics(wrapped, startY)
         processedLineLayouts[logicalLine] = {
@@ -1576,7 +1594,6 @@ export function createLines(
     return { start, end }
   }
 
-  return { visualLines, visualLinesByLogicalLine, totalWidth, totalHeight, getVisibleVisualLines,
-    getLastVisualLine, getFirstVisualLine, getApproxCaretMetrics, getApproxContentMetrics,
-    getApproxVisibleLogicalRange, resetLayoutCache }
+  return { visualLines, visualLinesByLogicalLine, totalWidth, totalHeight, getVisibleVisualLines, getLastVisualLine,
+    getFirstVisualLine, getApproxCaretMetrics, getApproxContentMetrics, getApproxVisibleLogicalRange, resetLayoutCache }
 }

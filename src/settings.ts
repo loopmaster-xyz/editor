@@ -118,9 +118,9 @@ export function createSettings(editorSettings: Partial<EditorSettings> = {}) {
       return {
         background: this.colors.black,
         blockColors: [
-          this.colors.brightYellow,
-          this.colors.brightPurple,
-          this.colors.brightBlue,
+          this.colors.yellow,
+          this.colors.purple,
+          this.colors.blue,
         ],
       }
     },

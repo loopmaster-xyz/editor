@@ -2,11 +2,12 @@ import { beforeEach, describe, expect, it } from 'bun:test'
 import { createDoc } from '../src/doc.ts'
 import {
   adjustWidgetsOnLineDeleteRange,
+  adjustWidgetsOnLineSplit,
   adjustWidgetsOnMultiLineDelete,
   type Widget,
 } from '../src/widget.ts'
 
-describe('Widget adjustments on line deletion', () => {
+describe('Widget adjustments', () => {
   let doc: ReturnType<typeof createDoc>
 
   beforeEach(() => {
@@ -60,6 +61,38 @@ describe('Widget adjustments on line deletion', () => {
       } as Widget
     }
   }
+
+  describe('adjustWidgetsOnLineSplit', () => {
+    it('moves inlay widgets to the inserted tail column when splitting a line', () => {
+      doc.widgets.push(
+        createWidget('inlay', 1, 8),
+        createWidget('inlay', 1, 2),
+        createWidget('inlay', 3, 5),
+      )
+
+      adjustWidgetsOnLineSplit(doc, 1, 2, 1, 4)
+
+      const movedInlay = doc.widgets.find(widget => widget.pos.y === 3 && widget.type === 'inlay')
+      const sameLineInlay = doc.widgets.find(widget => widget.pos.y === 2 && widget.type === 'inlay')
+      const shiftedLineInlay = doc.widgets.find(widget => widget.pos.y === 5 && widget.type === 'inlay')
+
+      expect(movedInlay?.pos.x).toBe(10)
+      expect(sameLineInlay?.pos.x).toBe(2)
+      expect(shiftedLineInlay?.pos.x).toBe(5)
+    })
+
+    it('moves errors to the inserted tail column when splitting a line', () => {
+      doc.errors.push(
+        { x: [8, 10], y: 2, message: 'error' },
+      )
+
+      adjustWidgetsOnLineSplit(doc, 1, 2, 1, 4)
+
+      expect(doc.errors).toHaveLength(1)
+      expect(doc.errors[0].y).toBe(3)
+      expect(doc.errors[0].x).toEqual([10, 12])
+    })
+  })
 
   describe('adjustWidgetsOnLineDeleteRange', () => {
     it('should remove widgets on deleted lines', () => {

@@ -15,6 +15,7 @@ export type BufferChange = {
   insertedText: string
   startLine?: number
   startColumn?: number
+  source?: 'history'
 } | {
   type: 'reset'
   prevCode: string
@@ -23,7 +24,7 @@ export type BufferChange = {
 
 export type BufferChangeListener = (change: BufferChange) => void
 
-function spliceChangeForOp(op: BufferOp): BufferChange {
+function spliceChangeForOp(op: BufferOp, source?: 'history'): BufferChange {
   if (op.type === BufferOpType.Insert) {
     return {
       type: 'splice',
@@ -32,6 +33,7 @@ function spliceChangeForOp(op: BufferOp): BufferChange {
       insertedText: op.text,
       startLine: op.startLine,
       startColumn: op.startColumn,
+      source,
     }
   }
   return {
@@ -41,6 +43,7 @@ function spliceChangeForOp(op: BufferOp): BufferChange {
     insertedText: '',
     startLine: op.startLine,
     startColumn: op.startColumn,
+    source,
   }
 }
 
@@ -287,6 +290,7 @@ export function createBuffer(bufferCode: string) {
       codeCache = value
       codeDirty = false
       codeLength = value.length
+      clearMergeWindow()
       emitChange({ type: 'reset', prevCode, nextCode: value })
       batch(() => {
         codeVersion.value++
@@ -304,6 +308,9 @@ export function createBuffer(bufferCode: string) {
   const index = signal(-1)
 
   let mergeTimestamp = -Infinity
+  const clearMergeWindow = () => {
+    mergeTimestamp = -Infinity
+  }
 
   const applyOp = (op: BufferOp, useHints = true) => {
     applyBufferOp(skipString, op)
@@ -519,7 +526,8 @@ export function createBuffer(bufferCode: string) {
       history.value.push(op)
       index.value++
     })
-    mergeTimestamp = now
+    if (merge) mergeTimestamp = now
+    else clearMergeWindow()
     emitChange(spliceChangeForOp(op))
   }
 
@@ -529,6 +537,7 @@ export function createBuffer(bufferCode: string) {
   {
     const op = history.value[index.value]
     if (!op) return null
+    clearMergeWindow()
     index.value--
     switch (op.type) {
       case BufferOpType.Insert: {
@@ -545,6 +554,7 @@ export function createBuffer(bufferCode: string) {
           insertedText: '',
           startLine: op.startLine,
           startColumn: op.startColumn,
+          source: 'history',
         })
         if (op.replace) {
           const deleteOp = history.value[index.value]
@@ -563,6 +573,7 @@ export function createBuffer(bufferCode: string) {
               insertedText: deleteOp.text,
               startLine: deleteOp.startLine,
               startColumn: deleteOp.startColumn,
+              source: 'history',
             })
             if (deleteOp.selection) {
               const lines = linesState
@@ -674,6 +685,7 @@ export function createBuffer(bufferCode: string) {
           insertedText: op.text,
           startLine: op.startLine,
           startColumn: op.startColumn,
+          source: 'history',
         })
         if (op.selection) {
           const lines = linesState
@@ -726,15 +738,16 @@ export function createBuffer(bufferCode: string) {
   {
     const op = history.value[index.value + 1]
     if (!op) return null
+    clearMergeWindow()
     index.value++
     applyOp(op, false)
-    emitChange(spliceChangeForOp(op))
+    emitChange(spliceChangeForOp(op, 'history'))
     if (op.replace) {
       const nextOp = history.value[index.value + 1]
       if (nextOp && nextOp.type === BufferOpType.Insert && nextOp.replace) {
         index.value++
         applyOp(nextOp, false)
-        emitChange(spliceChangeForOp(nextOp))
+        emitChange(spliceChangeForOp(nextOp, 'history'))
         if (nextOp.selection) {
           const lines = linesState
           const maxLine = Math.max(0, lines.length - 1)

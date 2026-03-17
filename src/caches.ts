@@ -3,6 +3,7 @@ import type { MatchingBrace } from './blocks.ts'
 import type { Canvas } from './canvas.ts'
 import type { Context } from './context.ts'
 import type { Doc, DocError } from './doc.ts'
+import type { DocIncrementalChange } from './doc.ts'
 import type { VisualLine } from './lines.ts'
 import type { Settings } from './settings.ts'
 import type { Token } from './token.ts'
@@ -13,12 +14,14 @@ export interface LineCanvas {
   braceAnalysisVersion: number
   braceRenderTokenVersion: number
   braceRenderTokenRef: Token[] | null
+  dpr: number
   c: OffscreenCanvasRenderingContext2D
   canvas: OffscreenCanvas
 }
 
 const MIN_LINE_CANVAS_DIMENSION = 32
 const MIN_LINE_CANVAS_POOL_SIZE = 128
+const LINE_CANVAS_PREWARM_BATCH_SIZE = 4
 
 function nextPowerOfTwo(value: number): number {
   let power = 1
@@ -37,6 +40,29 @@ function makeLineCanvasBucketKey(width: number, height: number): string {
 
 function getLineCanvasSegmentKey(logicalLine: number, tokenOffset: number): string {
   return `${logicalLine}:${tokenOffset}`
+}
+
+function parseLineCanvasSegmentKey(segmentKey: string): { logicalLine: number; tokenOffset: number } | null {
+  const delimiterIndex = segmentKey.indexOf(':')
+  if (delimiterIndex < 0) return null
+
+  const logicalLine = Number.parseInt(segmentKey.slice(0, delimiterIndex), 10)
+  const tokenOffset = Number.parseInt(segmentKey.slice(delimiterIndex + 1), 10)
+  if (!Number.isFinite(logicalLine) || !Number.isFinite(tokenOffset)) return null
+  return { logicalLine, tokenOffset }
+}
+
+function rewriteLineCanvasCacheKeyLogicalLine(lineCacheKey: string, logicalLine: number): string {
+  if (!lineCacheKey) return lineCacheKey
+
+  const firstDelimiterIndex = lineCacheKey.indexOf('|')
+  if (firstDelimiterIndex < 0) return ''
+  const secondDelimiterIndex = lineCacheKey.indexOf('|', firstDelimiterIndex + 1)
+  if (secondDelimiterIndex < 0) return ''
+  const thirdDelimiterIndex = lineCacheKey.indexOf('|', secondDelimiterIndex + 1)
+  if (thirdDelimiterIndex < 0) return ''
+
+  return `${lineCacheKey.slice(0, secondDelimiterIndex + 1)}${logicalLine}${lineCacheKey.slice(thirdDelimiterIndex)}`
 }
 
 const logicalTokenLineIdCache = new WeakMap<Token[], number>()
@@ -72,7 +98,7 @@ function getWidgetCacheKey(widget: Widget): string {
     return `${type}${widget.pos.x}${widget.pos.y}${widget.pos.width}`
   }
   else if (widget.type === 'inlay') {
-    return `${type}${widget.pos.x}${widget.pos.y}${widget.content}`
+    return `${type}${widget.pos.x}${widget.pos.y}${widget.content}${widget.fontSize ?? ''}`
   }
   else {
     return `${type}${widget.pos.y}`
@@ -114,7 +140,7 @@ export function getLineCacheKey(context: Context, line: VisualLine, logicalLineT
   const firstLogicalCharOffset = first?.logicalCharOffset ?? -1
   const lastLogicalTokenIndex = last?.logicalTokenIndex ?? -1
   const lastLogicalCharOffset = last?.logicalCharOffset ?? -1
-  return `${docIdentityId}|${tokenLineId}|${line.logicalLine}|${line.tokenOffset}|${line.tokens.length}|${firstLogicalTokenIndex}|${firstLogicalCharOffset}|${lastLogicalTokenIndex}|${lastLogicalCharOffset}|${line.width}|${line.height}|${context.canvas.ligatureDpr.value}|${context.settings.lineHeight}|${context.settings.fontSize}|${context.doc.revision}`
+  return `${docIdentityId}|${tokenLineId}|${line.logicalLine}|${line.tokenOffset}|${line.tokens.length}|${firstLogicalTokenIndex}|${firstLogicalCharOffset}|${lastLogicalTokenIndex}|${lastLogicalCharOffset}|${line.width}|${line.height}|${context.canvas.ligatureDpr.value}|${context.settings.lineHeight}|${context.settings.fontSize}`
 }
 
 export type Caches = ReturnType<typeof createCaches>
@@ -173,6 +199,10 @@ export function createCaches(canvas: Canvas, settings: Settings, doc: Doc) {
   let matchingBraceCache = activeDocCacheState.matchingBraceCache
   let getXFromColumnCache = activeDocCacheState.getXFromColumnCache
   let findVisualLineForColumnCache = activeDocCacheState.findVisualLineForColumnCache
+  let lineCanvasPrewarmTimer: number | null = null
+  let pendingLineCanvasPrewarm:
+    | { width: number; height: number; dpr: number; bucketKey: string; count: number }
+    | null = null
 
   const syncLineCanvasPoolCount = () => {
     activeDocCacheState.lineCanvasPoolCount = lineCanvasPoolCount
@@ -229,6 +259,62 @@ export function createCaches(canvas: Canvas, settings: Settings, doc: Doc) {
     }
   }
 
+  const createLineCanvas = (width: number, height: number, dpr: number): LineCanvas => {
+    const canvas = new OffscreenCanvas(width, height)
+    const c = canvas.getContext('2d')
+    c.setTransform(dpr, 0, 0, dpr, 0, 0)
+    return {
+      lineCacheKey: '',
+      braceAnalysisVersion: -1,
+      braceRenderTokenVersion: -1,
+      braceRenderTokenRef: null,
+      dpr,
+      canvas,
+      c,
+    }
+  }
+
+  const cancelLineCanvasPrewarm = () => {
+    if (lineCanvasPrewarmTimer !== null) {
+      window.clearTimeout(lineCanvasPrewarmTimer)
+      lineCanvasPrewarmTimer = null
+    }
+    pendingLineCanvasPrewarm = null
+  }
+
+  const flushLineCanvasPrewarm = () => {
+    lineCanvasPrewarmTimer = null
+    const pending = pendingLineCanvasPrewarm
+    if (!pending) return
+
+    const bucket = lineCanvasPoolByBucket.get(pending.bucketKey) ?? []
+    const missing = pending.count - bucket.length
+    if (missing <= 0) {
+      pendingLineCanvasPrewarm = null
+      if (!lineCanvasPoolByBucket.has(pending.bucketKey) && bucket.length > 0) {
+        lineCanvasPoolByBucket.set(pending.bucketKey, bucket)
+      }
+      return
+    }
+
+    const batchSize = Math.min(LINE_CANVAS_PREWARM_BATCH_SIZE, missing)
+    for (let i = 0; i < batchSize; i++) {
+      bucket.push(createLineCanvas(pending.width, pending.height, pending.dpr))
+    }
+
+    lineCanvasPoolByBucket.set(pending.bucketKey, bucket)
+    lineCanvasPoolCount += batchSize
+    syncLineCanvasPoolCount()
+    trimLineCanvasPool()
+
+    if (bucket.length >= pending.count) {
+      pendingLineCanvasPrewarm = null
+      return
+    }
+
+    lineCanvasPrewarmTimer = window.setTimeout(flushLineCanvasPrewarm, 0)
+  }
+
   const trimLineCanvasPool = () => {
     const maxPoolSize = Math.max(MIN_LINE_CANVAS_POOL_SIZE, lineCanvasBudget * 2)
     while (lineCanvasPoolCount > maxPoolSize) {
@@ -251,6 +337,7 @@ export function createCaches(canvas: Canvas, settings: Settings, doc: Doc) {
     lineCanvas.braceAnalysisVersion = -1
     lineCanvas.braceRenderTokenVersion = -1
     lineCanvas.braceRenderTokenRef = null
+    lineCanvas.c.clearRect(0, 0, lineCanvas.canvas.width / lineCanvas.dpr, lineCanvas.canvas.height / lineCanvas.dpr)
     const bucketKey = makeLineCanvasBucketKey(lineCanvas.canvas.width, lineCanvas.canvas.height)
     const bucket = lineCanvasPoolByBucket.get(bucketKey)
     if (bucket) bucket.push(lineCanvas)
@@ -258,6 +345,76 @@ export function createCaches(canvas: Canvas, settings: Settings, doc: Doc) {
     lineCanvasPoolCount++
     syncLineCanvasPoolCount()
     trimLineCanvasPool()
+  }
+
+  const releaseLineCanvas = (lineCanvas: LineCanvas) => {
+    if (lineCanvas.lineCacheKey) {
+      lineCanvasCache.delete(lineCanvas.lineCacheKey)
+    }
+    recycleLineCanvas(lineCanvas)
+  }
+
+  const rebaseLineCanvasCachesForIncrementalChange = (change: DocIncrementalChange) => {
+    if (change.source === 'reset') {
+      clearDrawCaches()
+      return
+    }
+
+    const lineDelta = change.endLineAfter - change.endLineBefore
+    if (lineDelta === 0 || lineCanvasCacheByLine.size === 0) return
+
+    const invalidateFromLine = Math.max(0, change.startLine)
+    const invalidateToLine = Math.max(invalidateFromLine - 1, change.endLineBefore)
+    const nextLineCanvasCacheByLine = new Map<string, LineCanvas>()
+
+    for (const [segmentKey, lineCanvas] of lineCanvasCacheByLine) {
+      const parsed = parseLineCanvasSegmentKey(segmentKey)
+      if (!parsed) {
+        nextLineCanvasCacheByLine.set(segmentKey, lineCanvas)
+        continue
+      }
+
+      const { logicalLine, tokenOffset } = parsed
+      if (logicalLine >= invalidateFromLine && logicalLine <= invalidateToLine) {
+        releaseLineCanvas(lineCanvas)
+        continue
+      }
+
+      if (logicalLine > invalidateToLine) {
+        const nextLogicalLine = logicalLine + lineDelta
+        if (nextLogicalLine < 0) {
+          releaseLineCanvas(lineCanvas)
+          continue
+        }
+
+        lineCanvas.lineCacheKey = rewriteLineCanvasCacheKeyLogicalLine(lineCanvas.lineCacheKey, nextLogicalLine)
+        nextLineCanvasCacheByLine.set(getLineCanvasSegmentKey(nextLogicalLine, tokenOffset), lineCanvas)
+        continue
+      }
+
+      nextLineCanvasCacheByLine.set(segmentKey, lineCanvas)
+    }
+
+    const nextLineCanvasUsageOrder = new Map<string, true>()
+    for (const segmentKey of lineCanvasUsageOrder.keys()) {
+      const parsed = parseLineCanvasSegmentKey(segmentKey)
+      if (!parsed) {
+        if (nextLineCanvasCacheByLine.has(segmentKey)) nextLineCanvasUsageOrder.set(segmentKey, true)
+        continue
+      }
+
+      const { logicalLine, tokenOffset } = parsed
+      if (logicalLine >= invalidateFromLine && logicalLine <= invalidateToLine) continue
+      const nextSegmentKey = logicalLine > invalidateToLine
+        ? getLineCanvasSegmentKey(logicalLine + lineDelta, tokenOffset)
+        : segmentKey
+      if (nextLineCanvasCacheByLine.has(nextSegmentKey)) nextLineCanvasUsageOrder.set(nextSegmentKey, true)
+    }
+
+    lineCanvasCacheByLine = nextLineCanvasCacheByLine
+    lineCanvasUsageOrder = nextLineCanvasUsageOrder
+    activeDocCacheState.lineCanvasCacheByLine = nextLineCanvasCacheByLine
+    activeDocCacheState.lineCanvasUsageOrder = nextLineCanvasUsageOrder
   }
 
   const trimLineCanvasesToBudget = () => {
@@ -283,6 +440,59 @@ export function createCaches(canvas: Canvas, settings: Settings, doc: Doc) {
     trimLineCanvasPool()
   }
 
+  const takeLineCanvasFromPool = (targetWidth: number, targetHeight: number, dpr: number): LineCanvas | null => {
+    const bucketSize = getLineCanvasBucketSize(targetWidth, targetHeight)
+    const bucketKey = makeLineCanvasBucketKey(bucketSize.width, bucketSize.height)
+    const bucket = lineCanvasPoolByBucket.get(bucketKey)
+    const pooled = bucket?.pop() ?? null
+    if (bucket && bucket.length === 0) lineCanvasPoolByBucket.delete(bucketKey)
+    if (!pooled) return null
+
+    lineCanvasPoolCount--
+    syncLineCanvasPoolCount()
+
+    const { canvas: pooledCanvas, c: pooledContext } = pooled
+    const needsResize = pooledCanvas.width !== bucketSize.width || pooledCanvas.height !== bucketSize.height
+    if (needsResize) {
+      pooledCanvas.width = bucketSize.width
+      pooledCanvas.height = bucketSize.height
+      pooledContext.setTransform(dpr, 0, 0, dpr, 0, 0)
+      pooledContext.clearRect(0, 0, pooledCanvas.width / dpr, pooledCanvas.height / dpr)
+    }
+    pooled.dpr = dpr
+    pooled.lineCacheKey = ''
+    pooled.braceAnalysisVersion = -1
+    pooled.braceRenderTokenVersion = -1
+    pooled.braceRenderTokenRef = null
+    return pooled
+  }
+
+  const scheduleLineCanvasPrewarm = (targetWidth: number, targetHeight: number, dpr: number, count: number) => {
+    const nextCount = Math.max(0, Math.floor(count))
+    if (nextCount === 0) {
+      cancelLineCanvasPrewarm()
+      return
+    }
+
+    const bucketSize = getLineCanvasBucketSize(targetWidth, targetHeight)
+    const bucketKey = makeLineCanvasBucketKey(bucketSize.width, bucketSize.height)
+    const pooledCount = lineCanvasPoolByBucket.get(bucketKey)?.length ?? 0
+    if (pooledCount >= nextCount) {
+      if (pendingLineCanvasPrewarm) cancelLineCanvasPrewarm()
+      return
+    }
+
+    pendingLineCanvasPrewarm = {
+      width: bucketSize.width,
+      height: bucketSize.height,
+      dpr,
+      bucketKey,
+      count: nextCount,
+    }
+    if (lineCanvasPrewarmTimer !== null) return
+    lineCanvasPrewarmTimer = window.setTimeout(flushLineCanvasPrewarm, 0)
+  }
+
   const markLineCanvasUsed = (segmentKey: string) => {
     if (lineCanvasUsageOrder.has(segmentKey)) {
       lineCanvasUsageOrder.delete(segmentKey)
@@ -291,43 +501,12 @@ export function createCaches(canvas: Canvas, settings: Settings, doc: Doc) {
   }
 
   const acquireLineCanvas = (targetWidth: number, targetHeight: number, dpr: number): LineCanvas => {
+    const pooled = takeLineCanvasFromPool(targetWidth, targetHeight, dpr)
+
+    if (pooled) return pooled
+
     const bucketSize = getLineCanvasBucketSize(targetWidth, targetHeight)
-    const bucketKey = makeLineCanvasBucketKey(bucketSize.width, bucketSize.height)
-    const bucket = lineCanvasPoolByBucket.get(bucketKey)
-    const pooled = bucket?.pop()
-    if (bucket && bucket.length === 0) lineCanvasPoolByBucket.delete(bucketKey)
-    if (pooled) {
-      lineCanvasPoolCount--
-      syncLineCanvasPoolCount()
-    }
-
-    if (!pooled) {
-      const canvas = new OffscreenCanvas(bucketSize.width, bucketSize.height)
-      const c = canvas.getContext('2d')
-      c.setTransform(dpr, 0, 0, dpr, 0, 0)
-      return {
-        lineCacheKey: '',
-        braceAnalysisVersion: -1,
-        braceRenderTokenVersion: -1,
-        braceRenderTokenRef: null,
-        canvas,
-        c,
-      }
-    }
-
-    const { canvas: pooledCanvas, c: pooledContext } = pooled
-    const needsResize = pooledCanvas.width !== bucketSize.width || pooledCanvas.height !== bucketSize.height
-    if (needsResize) {
-      pooledCanvas.width = bucketSize.width
-      pooledCanvas.height = bucketSize.height
-      pooledContext.setTransform(dpr, 0, 0, dpr, 0, 0)
-    }
-    pooledContext.clearRect(0, 0, pooledCanvas.width / dpr, pooledCanvas.height / dpr)
-    pooled.lineCacheKey = ''
-    pooled.braceAnalysisVersion = -1
-    pooled.braceRenderTokenVersion = -1
-    pooled.braceRenderTokenRef = null
-    return pooled
+    return createLineCanvas(bucketSize.width, bucketSize.height, dpr)
   }
 
   const clear = () => {
@@ -336,6 +515,7 @@ export function createCaches(canvas: Canvas, settings: Settings, doc: Doc) {
   }
 
   const clearDrawCaches = () => {
+    cancelLineCanvasPrewarm()
     lineCanvasCache.clear()
     lineCanvasCacheByLine.clear()
     lineCanvasPoolByBucket.clear()
@@ -385,14 +565,22 @@ export function createCaches(canvas: Canvas, settings: Settings, doc: Doc) {
   }
 
   effect(() => {
-    doc.widgets
     canvas.dpr.value
-    settings.lineHeight
     settings.fontSize
+    clear()
+  })
+
+  effect(() => {
     settings.theme
+    clearDrawCaches()
+  })
+
+  effect(() => {
+    doc.widgetVersion
+    settings.lineHeight
     settings.wordWrap
     settings.autoHeight
-    clear()
+    clearVisualCaches()
   })
 
   effect(() => {
@@ -405,7 +593,10 @@ export function createCaches(canvas: Canvas, settings: Settings, doc: Doc) {
     findVisualLineForColumnCache.clear()
   })
 
+  const disposeIncrementalLineCanvasRebase = doc.onIncrementalChange(rebaseLineCanvasCachesForIncrementalChange)
+
   const dispose = () => {
+    disposeIncrementalLineCanvasRebase()
     clear()
   }
 
@@ -418,9 +609,11 @@ export function createCaches(canvas: Canvas, settings: Settings, doc: Doc) {
       return lineCanvasCacheByLine
     },
     acquireLineCanvas,
+    takeLineCanvasFromPool,
     getLineCanvasBucketSize,
     markLineCanvasUsed,
     setLineCanvasBudget,
+    scheduleLineCanvasPrewarm,
     trimLineCanvasesToBudget,
     getLineCanvasSegmentKey,
     get wrapTokensCache() {

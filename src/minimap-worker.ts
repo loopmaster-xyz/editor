@@ -15,7 +15,7 @@ const MINIMAP_TOKEN_TYPES: TokenType[] = [
   'string',
   'number',
   'boolean',
-  'null',
+  'builtin',
   'operator',
   'punctuation',
   'comment',

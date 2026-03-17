@@ -60,6 +60,43 @@ export function createKeyboard(
     doc.keyHoldActive = repeatingInputKeys.size > 0
   }
 
+  function analyzeInsertedText(text: string): { newlineCount: number; tailLength: number } {
+    const newlineCount = (text.match(/\n/g) || []).length
+    if (newlineCount === 0) return { newlineCount: 0, tailLength: text.length }
+    const lastNewlineIndex = text.lastIndexOf('\n')
+    return {
+      newlineCount,
+      tailLength: lastNewlineIndex >= 0 ? text.length - lastNewlineIndex - 1 : 0,
+    }
+  }
+
+  function adjustWidgetsOnReplaceSelection(
+    startLine: number,
+    startColumn: number,
+    endLine: number,
+    endColumn: number,
+    insertedText: string,
+  ) {
+    const startLineText = doc.lines[startLine] || ''
+    const endLineText = doc.lines[endLine] || ''
+
+    adjustWidgetsOnMultiLineDelete(doc, startLine, startColumn, endLine, endColumn, startLineText.length)
+
+    if (insertedText.length === 0) return
+
+    const { newlineCount, tailLength } = analyzeInsertedText(insertedText)
+    if (newlineCount > 0) {
+      adjustWidgetsOnLineSplit(doc, startLine, startColumn, newlineCount, tailLength)
+      return
+    }
+
+    const suffixLength = endLine === startLine
+      ? Math.max(0, startLineText.length - endColumn)
+      : Math.max(0, endLineText.length - endColumn)
+    const newLineLength = startColumn + suffixLength + insertedText.length
+    adjustWidgetsOnColumnInsert(doc, startLine, startColumn, insertedText.length, newLineLength)
+  }
+
   function insertText(text: string) {
     if (selection.hasSelection.value) {
       const ordered = selection.getOrdered.value
@@ -70,8 +107,9 @@ export function createKeyboard(
         const endColumn = ordered.end.column
         const selectionDirection = selection.direction.value
 
-        const linesBeforeReplace = doc.lines.length
         const deletedLineCount = endLine > startLine ? endLine - startLine : 0
+        const { newlineCount } = analyzeInsertedText(text)
+        const insertedLineCount = newlineCount > 0 ? newlineCount : 0
 
         const selectionDir = selectionDirection === 'forward' || selectionDirection === 'backward'
           ? selectionDirection
@@ -83,17 +121,15 @@ export function createKeyboard(
             direction: selectionDir,
           }
           : undefined
+
+        adjustWidgetsOnReplaceSelection(startLine, startColumn, endLine, endColumn, text)
+
         doc.buffer.replaceSelection(
           { line: startLine, column: startColumn },
           { line: endLine, column: endColumn },
           text,
           selectionObj,
         )
-
-        const linesAfterReplace = doc.lines.length
-        const newlineCount = (text.match(/\n/g) || []).length
-        const insertedLineCount = newlineCount > 0 ? newlineCount : 0
-        const netLineChange = linesAfterReplace - linesBeforeReplace
 
         if (deletedLineCount > 0) {
           caches.adjustWrapTokensCacheOnLineDeleteRange(startLine + 1, endLine)
@@ -125,13 +161,13 @@ export function createKeyboard(
       }
     }
 
-    const newlineCount = (text.match(/\n/g) || []).length
+    const { newlineCount, tailLength } = analyzeInsertedText(text)
     if (newlineCount > 0) {
       const insertLine = caret.line.value
       const insertColumn = caret.column.value
       const linesBeforeInsert = doc.lines.length
 
-      adjustWidgetsOnLineSplit(doc, insertLine, insertColumn, newlineCount)
+      adjustWidgetsOnLineSplit(doc, insertLine, insertColumn, newlineCount, tailLength)
 
       doc.buffer.insert(insertLine, insertColumn, text)
 
@@ -1469,8 +1505,9 @@ export function createKeyboard(
     const textToInsert = '\n' + textToDuplicate
     const insertLine = endLine
     const insertColumn = endColumn
+    const tailLength = textToInsert.length - textToInsert.lastIndexOf('\n') - 1
 
-    adjustWidgetsOnLineSplit(doc, insertLine, insertColumn, insertedLineCount + 1)
+    adjustWidgetsOnLineSplit(doc, insertLine, insertColumn, insertedLineCount + 1, tailLength)
     doc.buffer.insert(insertLine, insertColumn, textToInsert)
 
     const linesAfterInsert = doc.lines.length
@@ -2388,7 +2425,6 @@ export function createKeyboard(
     }
     else if ((ctrl || meta) && key === 'z' && !shift) {
       const result = doc.buffer.undo()
-      caches.clearDrawCaches()
       if (result) {
         caret.line.value = result.line
         caret.column.value = result.column
@@ -2416,7 +2452,6 @@ export function createKeyboard(
     }
     else if ((ctrl || meta) && (key === 'y' || (key === 'z' && shift))) {
       const result = doc.buffer.redo()
-      caches.clearDrawCaches()
       if (result) {
         caret.line.value = result.line
         caret.column.value = result.column
@@ -2606,7 +2641,8 @@ export function createKeyboard(
         const caretPositionAfter = { line: caret.line.value + 1, column: newIndent.length }
 
         const linesBeforeInsert = doc.lines.length
-        adjustWidgetsOnLineSplit(doc, caret.line.value, startColumn, 2)
+        const tailLength = newText.length - newText.lastIndexOf('\n') - 1
+        adjustWidgetsOnLineSplit(doc, caret.line.value, startColumn, 2, tailLength)
         caches.invalidateWrapTokensCacheForLine(caret.line.value)
         for (const [lineNum] of caches.wrapTokensCacheByLine.entries()) {
           if (lineNum > caret.line.value) caches.invalidateWrapTokensCacheForLine(lineNum)
@@ -2676,7 +2712,8 @@ export function createKeyboard(
           const caretPositionAfter = { line: caret.line.value + 1, column: newIndent.length }
 
           const linesBeforeInsert = doc.lines.length
-          adjustWidgetsOnLineSplit(doc, caret.line.value, startColumn, 2)
+          const tailLength = newText.length - newText.lastIndexOf('\n') - 1
+          adjustWidgetsOnLineSplit(doc, caret.line.value, startColumn, 2, tailLength)
           caches.invalidateWrapTokensCacheForLine(caret.line.value)
           for (const [lineNum] of caches.wrapTokensCacheByLine.entries()) {
             if (lineNum > caret.line.value) caches.invalidateWrapTokensCacheForLine(lineNum)
@@ -2759,8 +2796,9 @@ export function createKeyboard(
               const endColumn = ordered.end.column
               const selectionDirection = selection.direction.value
 
-              const linesBeforeReplace = doc.lines.length
               const deletedLineCount = endLine > startLine ? endLine - startLine : 0
+              const { newlineCount } = analyzeInsertedText(pair)
+              const insertedLineCount = newlineCount > 0 ? newlineCount : 0
 
               const selectionDir = selectionDirection === 'forward' || selectionDirection === 'backward'
                 ? selectionDirection
@@ -2772,16 +2810,15 @@ export function createKeyboard(
                   direction: selectionDir,
                 }
                 : undefined
+
+              adjustWidgetsOnReplaceSelection(startLine, startColumn, endLine, endColumn, pair)
+
               doc.buffer.replaceSelection(
                 { line: startLine, column: startColumn },
                 { line: endLine, column: endColumn },
                 pair,
                 selectionObj,
               )
-
-              const linesAfterReplace = doc.lines.length
-              const newlineCount = 0
-              const insertedLineCount = newlineCount > 0 ? newlineCount : 0
 
               if (deletedLineCount > 0) {
                 caches.adjustWrapTokensCacheOnLineDeleteRange(startLine + 1, endLine)

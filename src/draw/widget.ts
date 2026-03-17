@@ -1,13 +1,26 @@
 import { type Context } from '../context.ts'
 import { getCharOffsetForVisualLine, getXFromColumnUnclamped, isLineEmpty } from '../line-utils.ts'
 import type { VisualLine } from '../lines.ts'
-import { measureText } from '../measure.ts'
 import type { Widget } from '../widget.ts'
 import { getVerticalScrollbarSize } from './scrollbar.ts'
 
 const hasAboveWidgetStartCache = new WeakMap<VisualLine[], boolean>()
 const nextAboveWidgetStartIndexCache = new WeakMap<VisualLine[], number[]>()
 const fallbackLogicalAboveHeightCache = new WeakMap<VisualLine[], Map<number, number>>()
+
+function measureInlayWidgetWidth(
+  c: CanvasRenderingContext2D,
+  context: Context,
+  content: string,
+  fontSize?: string,
+): number {
+  const size = fontSize ?? context.settings.fontSize
+  c.save()
+  c.font = `400 normal ${size} '${context.settings.fontFamilyName}', monospace`
+  const width = c.measureText(content).width
+  c.restore()
+  return width
+}
 
 function hasAnyAboveWidgetStart(visualLines: VisualLine[]): boolean {
   const cached = hasAboveWidgetStartCache.get(visualLines)
@@ -295,9 +308,9 @@ export function drawInlayWidgets(
       if (widgetColumn >= currentCharOffset && widgetColumn <= tokenEnd) {
         const widgetX = getXFromColumnUnclamped(lines, line, widgetColumn, tokenLines, context.canvas, context.settings,
           context.caches)
-        const { width } = measureText(c, context.settings, context.caches, { text: widget.content, type: 'text' })
+        const width = measureInlayWidgetWidth(c, context, widget.content, widget.fontSize)
         c.save()
-        c.font = `400 normal ${context.settings.fontSize} '${context.settings.fontFamilyName}', monospace`
+        c.font = `400 normal ${widget.fontSize ?? context.settings.fontSize} '${context.settings.fontFamilyName}', monospace`
         c.textBaseline = 'top'
         widget.draw(c, widgetX, lineY, width, lineHeight)
         c.restore()

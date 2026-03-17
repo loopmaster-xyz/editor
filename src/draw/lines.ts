@@ -136,7 +136,7 @@ export function drawLine(
     lineCanvasCacheByLine,
     getLineCanvasSegmentKey,
     getLineCanvasBucketSize,
-    acquireLineCanvas,
+    takeLineCanvasFromPool,
     markLineCanvasUsed,
   } = caches
 
@@ -357,10 +357,17 @@ export function drawLine(
 
   let lineCanvas = lineCanvasCacheByLine.get(lineCanvasSegmentKey)
   if (!lineCanvas) {
-    needsRedraw = true
     const metrics = measureVisualTokens(c, settings, caches, visualTokens)
     const lineWidth = Math.max(metrics.width, line.width)
-    lineCanvas = acquireLineCanvas(lineWidth * dpr.value, metrics.height * dpr.value, dpr.value)
+    lineCanvas = takeLineCanvasFromPool(lineWidth * dpr.value, metrics.height * dpr.value, dpr.value)
+    if (!lineCanvas) {
+      drawLineDecorations()
+      c.save()
+      renderLineTokens(c, contentY + 2, false)
+      c.restore()
+      return
+    }
+    needsRedraw = true
     lineCanvas.lineCacheKey = lineCacheKey
     lineCanvasCacheByLine.set(lineCanvasSegmentKey, lineCanvas)
   }
@@ -429,7 +436,12 @@ export function drawLine(
 }
 
 export function drawLines(context: Context) {
-  const { size: { height: { value: height } } } = context.canvas
+  const {
+    size: {
+      width: { value: width },
+      height: { value: height },
+    },
+  } = context.canvas
   const { paddingTop } = context.settings
   const { x, y } = context.scroll.pos
   const scrollDeltaX = Math.abs(context.scroll.targetX.value - x)
@@ -463,7 +475,16 @@ export function drawLines(context: Context) {
   }
   if (visualLines.length === 0) return
   if (!useDirectDraw) {
-    context.caches.setLineCanvasBudget(Math.max(64, visualLines.length * 3))
+    const lineCanvasBudget = Math.max(64, visualLines.length * 3)
+    context.caches.setLineCanvasBudget(lineCanvasBudget)
+    const lineCanvasSpareCount = Math.max(16, Math.min(lineCanvasBudget, visualLines.length))
+    const contentWidth = Math.max(1, width - context.gutter.width.value - context.settings.paddingLeft)
+    context.caches.scheduleLineCanvasPrewarm(
+      contentWidth * context.canvas.dpr.value,
+      context.settings.lineHeight * context.canvas.dpr.value,
+      context.canvas.dpr.value,
+      lineCanvasSpareCount,
+    )
   }
   for (let i = 0; i < visualLines.length; i++) {
     drawLine(context, visualLines[i], useDirectDraw)

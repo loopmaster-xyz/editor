@@ -5,11 +5,12 @@ export type TokenType =
   | 'string'
   | 'number'
   | 'boolean'
-  | 'null'
+  | 'builtin'
   | 'operator'
   | 'punctuation'
   | 'comment'
   | 'text'
+  | 'parameter'
   | 'special'
 
 export interface Token {

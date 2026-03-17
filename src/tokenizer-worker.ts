@@ -1,20 +1,5 @@
 import type { Token } from './token.ts'
-
-type TokenizeChunkRequest = {
-  type: 'tokenizeChunk'
-  jobId: number
-  revision: number
-  startLine: number
-  lines: string[]
-}
-
-type TokenizeChunkResponse = {
-  type: 'tokenizeChunkResult'
-  jobId: number
-  revision: number
-  startLine: number
-  tokenLines: Token[][]
-}
+import type { IncrementalTokenizerWorkerRequest, IncrementalTokenizerWorkerResponse } from './tokenizer.ts'
 
 function tokenizeLine(line: string): Token[] {
   return [...line.matchAll(/\s+|.+/g)]
@@ -22,17 +7,36 @@ function tokenizeLine(line: string): Token[] {
     .map(text => ({ text: text[0], type: 'text' as const }))
 }
 
-self.onmessage = (event: MessageEvent<TokenizeChunkRequest>) => {
+function annotateTokenLinePositions(tokens: Token[], lineIndex: number): Token[] {
+  let column = 1
+  const line = lineIndex + 1
+
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i]
+    token.line = line
+    token.column = column
+    column += token.text.length
+  }
+
+  return tokens
+}
+
+self.onmessage = (event: MessageEvent<IncrementalTokenizerWorkerRequest>) => {
   const message = event.data
   if (!message || message.type !== 'tokenizeChunk') return
 
-  const tokenLines = message.lines.map(tokenizeLine)
-  const response: TokenizeChunkResponse = {
+  const states: unknown[] = new Array(message.lines.length).fill(null)
+  const tokenLines = message.lines.map((line, lineIndex) =>
+    annotateTokenLinePositions(tokenizeLine(line), message.startLine + lineIndex),
+  )
+  const response: IncrementalTokenizerWorkerResponse = {
     type: 'tokenizeChunkResult',
     jobId: message.jobId,
     revision: message.revision,
     startLine: message.startLine,
     tokenLines,
+    states,
+    processedEndLine: Math.max(message.startLine, message.startLine + message.lines.length - 1),
   }
   self.postMessage(response)
 }

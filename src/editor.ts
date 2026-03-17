@@ -22,7 +22,18 @@ export { measureText } from './measure.ts'
 export { type OverlayCanvas } from './overlay-canvas.ts'
 export { draw } from './render-manager.ts'
 export { type Token, type TokenType } from './token.ts'
-export { type Tokenizer } from './tokenizer.ts'
+export {
+  isIncrementalTokenizer,
+  tokenizeAll,
+  tokenizeIncremental,
+  type IncrementalTokenizeLineResult,
+  type IncrementalTokenizer,
+  type IncrementalTokenizerWorkerRequest,
+  type IncrementalTokenizerWorkerResponse,
+  type IncrementalTokenizeResult,
+  type Tokenizer,
+  type TokenizerLegacy,
+} from './tokenizer.ts'
 export { type Widget, type Widgets, type WidgetType } from './widget.ts'
 export { type Canvas, EditorSettings }
 export type OnHoverToken = (canvas: Canvas, x: number, y: number, token: Token, callBlock: Token[],
@@ -89,6 +100,7 @@ export function createEditor(settings: Partial<EditorSettings> = {}) {
       doc.tokenizationPending = newDoc.tokenizationPending
       doc.keyHoldActive = newDoc.keyHoldActive
       doc.widgets = newDoc.widgets
+      doc.widgetVersion = newDoc.widgetVersion
       doc.errors = newDoc.errors
       doc.collapsed = newDoc.collapsed
       Object.assign(doc.caret, newDoc.caret)
@@ -113,14 +125,14 @@ export function createEditor(settings: Partial<EditorSettings> = {}) {
               start: change.start,
               end: change.start + change.deletedText.length,
               text: change.deletedText,
-            }, true)
+            }, false)
           }
           if (change.insertedText.length) {
             target.buffer.apply({
               type: BufferOpType.Insert,
               index: change.start,
               text: change.insertedText,
-            }, true)
+            }, false)
           }
         }
 
@@ -131,6 +143,8 @@ export function createEditor(settings: Partial<EditorSettings> = {}) {
             applyTo(newDoc, change)
             newDoc.buffer.history.value = doc.buffer.history.value
             newDoc.buffer.index.value = doc.buffer.index.value
+            newDoc.widgets = doc.widgets
+            newDoc.widgetVersion = doc.widgetVersion
             applyingFromDoc = false
             return
           }
@@ -138,6 +152,8 @@ export function createEditor(settings: Partial<EditorSettings> = {}) {
           newDoc.buffer.code.value = change.nextCode
           newDoc.buffer.history.value = doc.buffer.history.value
           newDoc.buffer.index.value = doc.buffer.index.value
+          newDoc.widgets = doc.widgets
+          newDoc.widgetVersion = doc.widgetVersion
           applyingFromDoc = false
         })
 
@@ -148,6 +164,8 @@ export function createEditor(settings: Partial<EditorSettings> = {}) {
             applyTo(doc, change)
             doc.buffer.history.value = newDoc.buffer.history.value
             doc.buffer.index.value = newDoc.buffer.index.value
+            doc.widgets = newDoc.widgets
+            doc.widgetVersion = newDoc.widgetVersion
             applyingFromNewDoc = false
             return
           }
@@ -155,6 +173,8 @@ export function createEditor(settings: Partial<EditorSettings> = {}) {
           doc.buffer.code.value = change.nextCode
           doc.buffer.history.value = newDoc.buffer.history.value
           doc.buffer.index.value = newDoc.buffer.index.value
+          doc.widgets = newDoc.widgets
+          doc.widgetVersion = newDoc.widgetVersion
           applyingFromNewDoc = false
         })
 
@@ -164,7 +184,9 @@ export function createEditor(settings: Partial<EditorSettings> = {}) {
         }
       })(),
       effect(() => {
+        newDoc.widgetVersion
         doc.widgets = newDoc.widgets
+        doc.widgetVersion = newDoc.widgetVersion
       }),
       effect(() => {
         doc.errors = newDoc.errors
